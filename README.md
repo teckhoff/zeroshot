@@ -130,6 +130,21 @@ zeroshot providers set-default codex
 zeroshot run 123 --provider gemini
 ```
 
+Different roles can use different providers — plan on one, implement on another,
+validate on a third. Set `providerByRole` in settings or a cluster config, or pass it
+per run:
+
+```bash
+zeroshot run 123 --worktree \
+  --role-provider planning=codex \
+  --role-provider implementation=claude \
+  --role-provider validator=gemini
+```
+
+`--provider` still forces one provider everywhere. Mixed-provider routing is not
+supported with `--docker` (preflight fails early). See
+[`docs/providers.md`](docs/providers.md) for the full precedence order.
+
 Issue backends are **auto-detected from your git remote**: **GitHub, GitLab, Jira, and Azure DevOps**. Paste a number, key, or URL:
 
 ```bash

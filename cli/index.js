@@ -61,6 +61,7 @@ const {
   decodeStdinEnv,
   buildTextInput,
   loadClusterConfig,
+  prepareClusterConfig,
   resolveConfigPath,
   resolveProviderOverride,
   startClusterFromFile,
@@ -200,7 +201,14 @@ function normalizeRunOptions(options) {
   // explicit autoMerge intent (e.g. a future `--auto-merge` flag) back to false.
 }
 
-async function runClusterPreflight({ input, options, providerOverride, settings, forceProvider }) {
+async function runClusterPreflight({
+  input,
+  options,
+  providerOverride,
+  settings,
+  forceProvider,
+  clusterConfig,
+}) {
   // Detect which issue provider tool is needed
   let issueProvider = null;
   let targetHost = null;
@@ -230,6 +238,7 @@ async function runClusterPreflight({ input, options, providerOverride, settings,
     requireGit: options.worktree,
     quiet: process.env.ZEROSHOT_DAEMON === '1',
     provider: providerOverride,
+    clusterConfig, // Validates every provider the role policy can select
     issueProvider, // Pass detected issue provider for tool checking
     targetHost, // Pass target host for multi-instance auth checks (e.g., GitLab self-hosted)
   });
@@ -384,6 +393,25 @@ function resolveClusterId(generateName) {
 
 function resolveConfigName(options, settings) {
   return options.config || settings.defaultConfig;
+}
+
+/**
+ * Resolve the cluster config far enough to know its provider routing, so
+ * preflight can validate every provider BEFORE any worktree or agent exists.
+ * Full schema validation still happens at the real load; a config that cannot
+ * be read here just falls back to the settings-level provider policy.
+ * @returns {Object|null}
+ */
+function loadConfigForPreflight(options, settings, providerOverride) {
+  const configPath = resolveConfigPath(resolveConfigName(options, settings));
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch {
+    return null;
+  }
+  // Spec errors must NOT be swallowed - surface them before anything starts.
+  return prepareClusterConfig(raw, settings, providerOverride, options.roleProvider);
 }
 
 function trackActiveCluster(clusterId, orchestrator) {
@@ -897,6 +925,10 @@ function printClusterAgent(agent) {
   }
   const modelLabel = agent.model ? ` [${agent.model}]` : '';
   console.log(`  - ${agent.id} (${agent.role})${modelLabel}`);
+  if (agent.provider) {
+    const sourceLabel = agent.providerSource ? ` (${agent.providerSource})` : '';
+    console.log(`    Provider: ${agent.provider}${sourceLabel}`);
+  }
   console.log(`    State: ${agent.state}`);
   console.log(`    Iteration: ${agent.iteration}`);
   console.log(`    Running task: ${agent.currentTask ? 'Yes' : 'No'}`);
@@ -2476,6 +2508,12 @@ program
   )
   .option('--workers <n>', 'Max sub-agents for worker to spawn in parallel', parseInt)
   .option('--provider <provider>', `Override all agents to use a provider (${PROVIDER_CHOICES})`)
+  .option(
+    '--role-provider <role=provider>',
+    'Provider for agents with a specific role, e.g. validator=gemini (repeatable)',
+    (value, acc) => [...(acc || []), value],
+    []
+  )
   .option('--model <model>', 'Override all agent models (provider-specific model id)')
   .option(
     '--sim <mode>',
@@ -2574,8 +2612,17 @@ Force provider flags: -G (GitHub), -L (GitLab), -J (Jira), -D (DevOps), -N (Line
           : detectRunInput(inputArg, settings, forceProvider);
       const providerOverride = resolveProviderOverride(options);
 
-      // Preflight checks
-      await runClusterPreflight({ input, options, providerOverride, settings, forceProvider });
+      // Preflight checks - resolve routing first so EVERY provider the cluster
+      // may use is validated before a worktree or agent is created.
+      const preflightConfig = loadConfigForPreflight(options, settings, providerOverride);
+      await runClusterPreflight({
+        input,
+        options,
+        providerOverride,
+        settings,
+        forceProvider,
+        clusterConfig: preflightConfig,
+      });
 
       // Secondary preflight: token-free template simulation/validation
       const simMode = String(options.sim || 'fast').toLowerCase();
@@ -2616,7 +2663,13 @@ Force provider flags: -G (GitHub), -L (GitLab), -J (Jira), -D (DevOps), -N (Line
       const configName = resolveConfigName(options, settings);
       const configPath = resolveConfigPath(configName);
       const orchestrator = await getOrchestrator();
-      const config = loadClusterConfig(orchestrator, configPath, settings, providerOverride);
+      const config = loadClusterConfig(
+        orchestrator,
+        configPath,
+        settings,
+        providerOverride,
+        options.roleProvider
+      );
       trackActiveCluster(clusterId, orchestrator);
       printForegroundStartInfo(options, clusterId, configName);
 
@@ -3264,16 +3317,14 @@ program
         // === PREFLIGHT CHECKS ===
         // Provider CLI must be installed; Docker needed if isolation was used
         const requiresDocker = cluster?.isolation?.enabled || false;
-        const providerName =
-          cluster.config?.forceProvider ||
-          cluster.config?.defaultProvider ||
-          settings.defaultProvider;
 
         await requirePreflight({
           requireGh: false, // Resume doesn't fetch new issues
           requireDocker: requiresDocker,
           quiet: false,
-          provider: providerName,
+          // Persisted config carries the role policy, so resume re-validates the
+          // same provider set the cluster originally routed to.
+          clusterConfig: cluster.config,
         });
 
         // === DETACH HANDOFF: hand the resume off to a daemon and return ===

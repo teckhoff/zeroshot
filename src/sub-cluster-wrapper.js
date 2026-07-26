@@ -16,6 +16,7 @@ const LogicEngine = require('./logic-engine');
 const MessageBusBridge = require('./message-bus-bridge');
 const { DEFAULT_MAX_ITERATIONS } = require('./agent/agent-config');
 const { bufferMessage, scheduleDrain, drainBufferedMessages } = require('./message-buffer');
+const { normalizeProviderByRole } = require('./provider-routing');
 
 function normalizeParentTopicConfig(entry) {
   if (typeof entry === 'string') {
@@ -448,6 +449,12 @@ class SubClusterWrapper {
     } else if (parentConfig.defaultProvider && !childConfig.defaultProvider) {
       childConfig.defaultProvider = parentConfig.defaultProvider;
     }
+
+    // Inherit the parent's role policy; child entries win per role.
+    childConfig.providerByRole = {
+      ...normalizeProviderByRole(parentConfig.providerByRole),
+      ...normalizeProviderByRole(childConfig.providerByRole),
+    };
 
     // Start child cluster with text input (context from parent)
     const childCluster = await childOrchestrator.start(

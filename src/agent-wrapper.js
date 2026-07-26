@@ -13,7 +13,7 @@
 const LogicEngine = require('./logic-engine');
 const { validateAgentConfig } = require('./agent/agent-config');
 const { loadSettings, validateModelAgainstMax, VALID_MODELS } = require('../lib/settings');
-const { normalizeProviderName } = require('../lib/provider-names');
+const { resolveAgentProvider } = require('./provider-routing');
 const { getProvider } = require('./providers');
 const { buildContext } = require('./agent/agent-context-builder');
 const { collectQueuedGuidance } = require('./agent/guidance-queue');
@@ -136,18 +136,21 @@ class AgentWrapper {
     }
   }
 
+  /**
+   * Resolve this agent's provider along with the layer that decided it.
+   * @returns {{provider: string, source: string, role: string|null}}
+   * @private
+   */
+  _resolveProviderRouting() {
+    return resolveAgentProvider({
+      agent: { ...this.config, role: this.role },
+      clusterConfig: this.cluster?.config || {},
+      settings: loadSettings(),
+    });
+  }
+
   _resolveProvider() {
-    const settings = loadSettings();
-    const clusterConfig = this.cluster?.config || {};
-
-    const resolved =
-      clusterConfig.forceProvider ||
-      this.config.provider ||
-      clusterConfig.defaultProvider ||
-      settings.defaultProvider ||
-      'claude';
-
-    return normalizeProviderName(resolved) || 'claude';
+    return this._resolveProviderRouting().provider;
   }
 
   _resolveModelSpec() {
@@ -584,13 +587,15 @@ class AgentWrapper {
    */
   getState() {
     const modelSpec = this._resolveModelSpec();
+    const routing = this._resolveProviderRouting();
     const hasLiveOrTrackedTask =
       this.state === 'executing_task' && (!!this.currentTask || !!this.currentTaskId);
     return {
       id: this.id,
       role: this.role,
       model: this._selectModel(),
-      provider: this._resolveProvider(),
+      provider: routing.provider,
+      providerSource: routing.source,
       modelSpec,
       state: this.state,
       iteration: this.iteration,

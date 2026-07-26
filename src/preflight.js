@@ -25,6 +25,7 @@ const {
   normalizeProviderName,
   resolveProviderCommand,
 } = require('../lib/provider-names');
+const { collectConfiguredProviders } = require('./provider-routing');
 const { detectGitContext } = require('../lib/git-remote-utils');
 const { readKeychainCredentials } = require('./claude-credentials');
 
@@ -562,6 +563,35 @@ function validateGitRequirement() {
 }
 
 /**
+ * Determine every provider this run may use, with the roles requiring each.
+ * `--provider` (options.provider) collapses the whole run to one provider.
+ * @param {Object} options
+ * @param {Object} settings
+ * @returns {Array<{provider: string, roles: string[]}>}
+ */
+function resolveProviderEntries(options, settings) {
+  if (options.provider) {
+    return [{ provider: normalizeProviderName(options.provider), roles: ['*'] }];
+  }
+
+  if (options.clusterConfig) {
+    return collectConfiguredProviders({ config: options.clusterConfig, settings });
+  }
+
+  return [
+    {
+      provider: normalizeProviderName(settings.defaultProvider || 'claude'),
+      roles: ['default'],
+    },
+  ];
+}
+
+function formatProviderRequirement({ provider, roles }) {
+  const label = roles.length === 1 ? 'role' : 'roles';
+  return `${provider}: required by ${label} ${roles.map((role) => `"${role}"`).join(', ')}\n`;
+}
+
+/**
  * Run all preflight checks
  * @param {Object} options - Preflight options
  * @param {boolean} options.requireGh - Whether gh CLI is required (true if using issue number)
@@ -569,7 +599,9 @@ function validateGitRequirement() {
  * @param {boolean} options.requireGit - Whether git repo is required (true if using --worktree)
  * @param {boolean} options.quiet - Suppress success messages
  * @param {string} options.claudeCommand - Custom Claude command (from settings)
- * @param {string} options.provider - Provider override
+ * @param {string} options.provider - Provider override (forces a single provider)
+ * @param {Object} options.clusterConfig - Cluster config; every provider its role
+ *   policy can select is validated (ignored when options.provider is set)
  * @returns {ValidationResult}
  */
 async function runPreflight(options = {}) {
@@ -595,13 +627,35 @@ async function runPreflight(options = {}) {
       warnings: [],
     };
   }
-  const providerName = normalizeProviderName(
-    options.provider || settings.defaultProvider || 'claude'
-  );
+  const providerEntries = resolveProviderEntries(options, settings);
 
-  const providerResult = validateProvider(providerName, options);
-  errors.push(...providerResult.errors);
-  warnings.push(...providerResult.warnings);
+  if (!options.quiet) {
+    for (const entry of providerEntries) {
+      console.log(formatProviderRequirement(entry));
+    }
+  }
+
+  for (const entry of providerEntries) {
+    const providerResult = validateProvider(entry.provider, options);
+    const context = formatProviderRequirement(entry);
+    errors.push(...providerResult.errors.map((err) => `${context}${err}`));
+    warnings.push(...providerResult.warnings.map((warn) => `${context}${warn}`));
+  }
+
+  // Mixed-provider Docker support is deferred: a single container image cannot
+  // host multiple provider CLIs with their credentials today.
+  if (options.requireDocker && providerEntries.length > 1) {
+    errors.push(
+      formatError(
+        'Mixed-provider role routing is not supported with --docker',
+        providerEntries.map((entry) => `${entry.provider}=${entry.roles.join('/')}`).join(', '),
+        [
+          'Use --worktree/--pr/--ship instead',
+          'Or use --provider <name> to force one provider for every agent',
+        ]
+      )
+    );
+  }
 
   // 4. Check issue provider CLI (if required)
   if (options.issueProvider) {
@@ -752,6 +806,7 @@ async function requirePreflight(options = {}) {
 
 module.exports = {
   runPreflight,
+  resolveProviderEntries,
   requirePreflight,
   getClaudeVersion,
   checkClaudeAuth,

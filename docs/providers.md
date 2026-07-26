@@ -27,6 +27,110 @@ Zeroshot supports two provider shapes:
 - Override per run: `zeroshot run ... --provider <provider>`
 - Env override: `ZEROSHOT_PROVIDER=codex`
 
+## Role-Based Provider Routing
+
+One cluster can use a different provider per agent role — for example planning on
+Codex, implementation on Claude, and every validator on Gemini. Configure it with
+`providerByRole`, a map from agent `role` to provider id.
+
+### Precedence
+
+Highest wins:
+
+1. `forceProvider` (set by `--provider` / `ZEROSHOT_PROVIDER`) — forces every agent
+2. `provider` on an individual agent — the per-agent exception
+3. `providerByRole[role]` in the cluster config
+4. `providerByRole[role]` in global settings
+5. `defaultProvider` in the cluster config
+6. `defaultProvider` in global settings
+7. `claude`
+
+All of this is resolved by one shared module, `src/provider-routing.js`. Runtime
+execution, config validation, and preflight use it — they never re-derive the order.
+
+### Cluster config
+
+```json
+{
+  "defaultProvider": "claude",
+  "providerByRole": {
+    "planning": "codex",
+    "implementation": "claude",
+    "validator": "gemini"
+  },
+  "agents": [
+    { "id": "planner", "role": "planning", "modelLevel": "level3" },
+    { "id": "worker", "role": "implementation", "modelLevel": "level2" },
+    { "id": "validator-requirements", "role": "validator", "modelLevel": "level2" }
+  ]
+}
+```
+
+Keys are exact agent role strings, so custom roles work too. Agents added at runtime
+by conductor templates (for example the `validator` and `coordinator` agents in the
+quick/heavy validation flow) inherit the mapping without any template change.
+
+Internal agents route by their declared role: the git pusher is
+`completion-detector`, and the injected stop-only completion detector is
+`orchestrator`.
+
+### Global settings
+
+```bash
+zeroshot settings set providerByRole '{"planning":"codex","validator":"gemini"}'
+zeroshot settings set providerByRole.validator opencode   # preserves other roles
+```
+
+A cluster-level entry overrides the corresponding settings entry. The default is `{}`,
+so configurations without any mapping behave exactly as before.
+
+### Per-run override
+
+```bash
+zeroshot run 123 --worktree \
+  --role-provider planning=codex \
+  --role-provider implementation=claude \
+  --role-provider validator=gemini
+```
+
+`--role-provider` merges into the cluster's `providerByRole` (CLI wins per role) and
+is forwarded to detached runs via `ZEROSHOT_RUN_OPTIONS`. `--provider` still forces a
+single provider for the entire run, overriding every role mapping and every explicit
+agent provider.
+
+### Preflight
+
+Startup validates _every_ provider the routing can select — availability, auth, and
+model settings — before a worktree is created or any agent runs, and reports all
+failures together:
+
+```text
+codex: required by role "planning"
+claude: required by roles "default", "implementation"
+gemini: required by role "validator"
+```
+
+Because conductor templates add agents after preflight, a provider named in
+`providerByRole` is checked even if no agent with that role exists yet.
+
+### Docker (deferred)
+
+Mixed-provider `--docker` runs are not supported: a single container image cannot host
+multiple provider CLIs with their credentials today. Preflight fails early with:
+
+```text
+Mixed-provider role routing is not supported with --docker.
+```
+
+Use `--worktree`/`--pr`/`--ship`, or `--provider <name>` to force one provider. A role
+mapping that resolves every agent to the same provider stays Docker-compatible.
+
+### Observability
+
+`zeroshot status <id>` shows each agent's effective provider and the layer that chose
+it (`Provider: gemini (cluster.providerByRole)`), and `--json` includes `provider` and
+`providerSource`. Cluster startup logs one routing summary line.
+
 ## Gateway Provider
 
 Use `gateway` for OpenAI-compatible model endpoints such as OpenRouter,

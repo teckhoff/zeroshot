@@ -2,7 +2,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { loadSettings, validateSetting } = require('../lib/settings');
+const { loadSettings, validateSetting, coerceValue, DEFAULT_SETTINGS } = require('../lib/settings');
 const {
   validateProviderFeatures,
   validateProviderSettings,
@@ -178,6 +178,79 @@ describe('Provider settings', function () {
     );
 
     assert.ok(result.warnings.some((warning) => warning.includes('low|medium|high|xhigh|max')));
+  });
+
+  it('defaults providerByRole to an empty object', function () {
+    delete process.env.ZEROSHOT_SETTINGS_FILE;
+    assert.deepStrictEqual(DEFAULT_SETTINGS.providerByRole, {});
+  });
+
+  it('validates providerByRole values', function () {
+    assert.strictEqual(
+      validateSetting('providerByRole', { planning: 'codex', validator: 'gemini' }),
+      null
+    );
+    assert.strictEqual(validateSetting('providerByRole', {}), null);
+
+    const error = validateSetting('providerByRole', { validator: 'not-a-provider' });
+    assert.ok(error, 'expected an error for an unknown provider');
+    assert.match(error, /providerByRole\.validator/);
+    assert.match(error, /unknown provider "not-a-provider"/);
+    assert.match(error, /Choose one of: .*gemini/);
+
+    assert.ok(validateSetting('providerByRole', ['codex']));
+  });
+
+  it('coerces providerByRole from JSON and normalizes aliases', function () {
+    assert.deepStrictEqual(coerceValue('providerByRole', '{"planning":"anthropic"}'), {
+      planning: 'claude',
+    });
+    assert.deepStrictEqual(coerceValue('providerByRole', { validator: 'openai' }), {
+      validator: 'codex',
+    });
+    assert.throws(() => coerceValue('providerByRole', 'not json'), /Invalid JSON for/);
+  });
+
+  it('normalizes providerByRole aliases when loading from disk', function () {
+    process.env.ZEROSHOT_SETTINGS_FILE = settingsFile;
+    fs.writeFileSync(
+      settingsFile,
+      JSON.stringify({ providerByRole: { planning: 'anthropic', validator: 'gemini' } }, null, 2),
+      'utf8'
+    );
+
+    const settings = loadSettings();
+    assert.deepStrictEqual(settings.providerByRole, { planning: 'claude', validator: 'gemini' });
+  });
+
+  it('preserves unrelated roles when one role is updated', function () {
+    process.env.ZEROSHOT_SETTINGS_FILE = settingsFile;
+    fs.writeFileSync(
+      settingsFile,
+      JSON.stringify({ providerByRole: { planning: 'codex', validator: 'gemini' } }, null, 2),
+      'utf8'
+    );
+
+    // What `zeroshot settings set providerByRole.validator opencode` does:
+    // load, mutate one role, validate the whole map, save.
+    const settings = loadSettings();
+    settings.providerByRole.validator = 'opencode';
+    assert.strictEqual(validateSetting('providerByRole', settings.providerByRole), null);
+    fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2), 'utf8');
+
+    assert.deepStrictEqual(loadSettings().providerByRole, {
+      planning: 'codex',
+      validator: 'opencode',
+    });
+  });
+
+  it('does not leak providerByRole mutations into the defaults', function () {
+    delete process.env.ZEROSHOT_SETTINGS_FILE;
+    const settings = loadSettings();
+    settings.providerByRole.validator = 'gemini';
+
+    assert.deepStrictEqual(DEFAULT_SETTINGS.providerByRole, {});
+    assert.deepStrictEqual(loadSettings().providerByRole, {});
   });
 
   it('applies legacy maxModel to claude levels', function () {

@@ -19,6 +19,7 @@ const { VALID_PROVIDERS, getProviderMetadata } = require('../lib/provider-names'
 
 const {
   runPreflight,
+  resolveProviderEntries,
   getClaudeVersion,
   checkClaudeAuth,
   checkGhAuth,
@@ -39,6 +40,7 @@ describe('Preflight Validation', function () {
   defineGhAuthTests();
   defineDockerTests();
   defineRunPreflightTests();
+  defineRoleRoutingPreflightTests();
   defineCliIntegrationTests();
 });
 
@@ -556,6 +558,134 @@ function defineRunPreflightTests() {
 
       expect(result).to.have.property('warnings');
       expect(Array.isArray(result.warnings)).to.be.true;
+    });
+  });
+}
+
+function defineRoleRoutingPreflightTests() {
+  describe('runPreflight() role-based provider routing', () => {
+    // Cluster whose role policy resolves to three distinct providers.
+    const MIXED_CONFIG = {
+      defaultProvider: 'claude',
+      providerByRole: { planning: 'codex', validator: 'gemini' },
+      agents: [
+        { id: 'planner', role: 'planning' },
+        { id: 'worker', role: 'implementation' },
+        { id: 'validator-requirements', role: 'validator' },
+      ],
+    };
+
+    const SINGLE_PROVIDER_CONFIG = {
+      defaultProvider: 'codex',
+      providerByRole: { planning: 'codex', validator: 'codex' },
+      agents: [
+        { id: 'planner', role: 'planning' },
+        { id: 'validator-requirements', role: 'validator' },
+      ],
+    };
+
+    async function preflightWithoutAnyCli(options) {
+      const originalPath = process.env.PATH;
+      process.env.PATH = '/nonexistent';
+      try {
+        return await runPreflight(options);
+      } finally {
+        process.env.PATH = originalPath;
+      }
+    }
+
+    it('resolves one entry per distinct effective provider with its roles', () => {
+      const entries = resolveProviderEntries({ clusterConfig: MIXED_CONFIG }, {});
+
+      expect(entries.map((entry) => entry.provider)).to.deep.equal(['claude', 'codex', 'gemini']);
+      const providers = entries.map((entry) => entry.provider);
+      expect(new Set(providers).size).to.equal(providers.length);
+      expect(entries.find((entry) => entry.provider === 'codex').roles).to.deep.equal(['planning']);
+      expect(entries.find((entry) => entry.provider === 'gemini').roles).to.deep.equal([
+        'validator',
+      ]);
+    });
+
+    it('collapses to a single entry when --provider forces one provider', () => {
+      const entries = resolveProviderEntries(
+        { provider: 'gemini', clusterConfig: MIXED_CONFIG },
+        {}
+      );
+      expect(entries).to.deep.equal([{ provider: 'gemini', roles: ['*'] }]);
+    });
+
+    it('falls back to the settings default when no cluster config is supplied', () => {
+      const entries = resolveProviderEntries({}, { defaultProvider: 'codex' });
+      expect(entries).to.deep.equal([{ provider: 'codex', roles: ['default'] }]);
+    });
+
+    it('aggregates failures from every unavailable provider in one result', async () => {
+      const result = await preflightWithoutAnyCli({
+        requireGh: false,
+        requireDocker: false,
+        quiet: true,
+        clusterConfig: MIXED_CONFIG,
+      });
+
+      expect(result.valid).to.be.false;
+      const errorText = result.errors.join('');
+      expect(errorText).to.include('Claude command not available');
+      expect(errorText).to.include(`${getProviderMetadata('codex').displayName} CLI not available`);
+      expect(errorText).to.include(
+        `${getProviderMetadata('gemini').displayName} CLI not available`
+      );
+    });
+
+    it('names the roles requiring each provider in its errors', async () => {
+      const result = await preflightWithoutAnyCli({
+        requireGh: false,
+        requireDocker: false,
+        quiet: true,
+        clusterConfig: MIXED_CONFIG,
+      });
+
+      const errorText = result.errors.join('');
+      expect(errorText).to.include('codex: required by role "planning"');
+      expect(errorText).to.include('gemini: required by role "validator"');
+      expect(errorText).to.include('claude: required by roles "default", "implementation"');
+    });
+
+    it('rejects --docker when the role policy resolves to multiple providers', async () => {
+      const result = await preflightWithoutAnyCli({
+        requireGh: false,
+        requireDocker: true,
+        quiet: true,
+        clusterConfig: MIXED_CONFIG,
+      });
+
+      expect(result.valid).to.be.false;
+      const errorText = result.errors.join('');
+      expect(errorText).to.include('Mixed-provider role routing is not supported with --docker');
+      expect(errorText).to.include('Use --worktree/--pr/--ship instead');
+      expect(errorText).to.include('Or use --provider <name> to force one provider');
+    });
+
+    it('does not reject --docker when every role resolves to one provider', async () => {
+      const result = await preflightWithoutAnyCli({
+        requireGh: false,
+        requireDocker: true,
+        quiet: true,
+        clusterConfig: SINGLE_PROVIDER_CONFIG,
+      });
+
+      expect(result.errors.join('')).to.not.include('Mixed-provider role routing');
+    });
+
+    it('does not reject --docker when --provider forces one provider', async () => {
+      const result = await preflightWithoutAnyCli({
+        requireGh: false,
+        requireDocker: true,
+        quiet: true,
+        provider: 'codex',
+        clusterConfig: MIXED_CONFIG,
+      });
+
+      expect(result.errors.join('')).to.not.include('Mixed-provider role routing');
     });
   });
 }

@@ -12,11 +12,8 @@
  */
 
 const { loadSettings } = require('../lib/settings');
-const {
-  VALID_PROVIDERS,
-  normalizeProviderName,
-  providerSupportsCapability,
-} = require('../lib/provider-names');
+const { VALID_PROVIDERS, providerSupportsCapability } = require('../lib/provider-names');
+const { resolveAgentProvider, validateProviderByRole } = require('./provider-routing');
 const { getProvider } = require('./providers');
 const { CAPABILITIES } = require('./providers/capabilities');
 const { GUIDANCE_TOPICS } = require('./guidance-topics');
@@ -1981,16 +1978,6 @@ function validateConfigSemantics(config) {
   return { errors, warnings };
 }
 
-function resolveProviderName(agent, config, settings) {
-  const resolved =
-    config.forceProvider ||
-    agent.provider ||
-    config.defaultProvider ||
-    settings.defaultProvider ||
-    'claude';
-  return normalizeProviderName(resolved) || 'claude';
-}
-
 function validateProviderLevel(provider, requestedLevel, minLevel, maxLevel) {
   const providerModule = getProvider(provider);
   const levels = providerModule.getLevelMapping();
@@ -2069,8 +2056,8 @@ function validateProviderSettings(provider, providerSettings) {
   }
 }
 
-function resolveAgentProvider(agent, config, settings, errors) {
-  const provider = resolveProviderName(agent, config, settings);
+function resolveAgentProviderOrError(agent, config, settings, errors) {
+  const { provider } = resolveAgentProvider({ agent, clusterConfig: config, settings });
   if (!VALID_PROVIDERS.includes(provider)) {
     errors.push(`Agent "${agent.id}" references unknown provider "${provider}"`);
     return null;
@@ -2195,6 +2182,8 @@ function validateProviderFeatures(config, settings) {
     }
   }
 
+  errors.push(...validateProviderByRole(config.providerByRole));
+
   if (!config.agents || !Array.isArray(config.agents)) {
     return { errors, warnings };
   }
@@ -2204,7 +2193,7 @@ function validateProviderFeatures(config, settings) {
       continue;
     }
 
-    const provider = resolveAgentProvider(agent, config, settings, errors);
+    const provider = resolveAgentProviderOrError(agent, config, settings, errors);
     if (!provider) continue;
 
     const { providerModule, levels, minLevel, maxLevel, rank } = buildProviderContext(

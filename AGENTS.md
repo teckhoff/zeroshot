@@ -33,6 +33,7 @@ Destructive commands (need permission): `zeroshot kill`, `zeroshot clear`, `zero
 | Trigger evaluation          | `src/logic-engine.js`                                                |
 | Agent wrapper               | `src/agent-wrapper.js`                                               |
 | Providers registry          | `src/providers/index.js`                                             |
+| Provider role routing       | `src/provider-routing.js`                                            |
 | Provider implementations    | `src/providers/`                                                     |
 | Provider engine registry    | `src/agent-cli-provider/provider-registry.ts`                        |
 | Gateway runner              | `src/agent-cli-provider/gateway-runner.ts`                           |
@@ -295,6 +296,37 @@ POSIX providers run in a dedicated process group; Windows providers use the exac
 - Provider names use CLI identifiers: `claude`, `codex`, `gemini`, `opencode`, `pi`, `copilot` (legacy `anthropic`/`openai`/`google` map to these).
 - `model` remains a provider-specific escape hatch.
 - Claude/Codex/Opencode only: `reasoningEffort` (`low|medium|high|xhigh|max`).
+
+### Role-Based Provider Routing
+
+**Resolve providers ONLY via `src/provider-routing.js`.** Never re-derive the
+precedence chain in an agent, validator, preflight, or lifecycle path — a second
+implementation is how validation and runtime silently disagree about which provider
+an agent uses.
+
+`providerByRole` maps an agent `role` to a provider id. Precedence, highest first:
+
+| #   | Layer                           | `providerSource`           |
+| --- | ------------------------------- | -------------------------- |
+| 1   | `cluster.forceProvider`         | `cluster.forceProvider`    |
+| 2   | `agent.provider`                | `agent.provider`           |
+| 3   | `cluster.providerByRole[role]`  | `cluster.providerByRole`   |
+| 4   | `settings.providerByRole[role]` | `settings.providerByRole`  |
+| 5   | `cluster.defaultProvider`       | `cluster.defaultProvider`  |
+| 6   | `settings.defaultProvider`      | `settings.defaultProvider` |
+| 7   | `'claude'`                      | `fallback`                 |
+
+- `resolveAgentProvider({ agent, clusterConfig, settings })` → `{ provider, source, role }`.
+- `collectConfiguredProviders({ config, settings })` → every provider the cluster may
+  use, with requiring roles. Preflight validates all of them before any worktree or
+  agent exists.
+- Routing is applied in `AgentWrapper`, so agents added at runtime
+  (`_opAddAgents`/`_opLoadConfig`) inherit it with **no template provider placeholders**.
+- **Never route on agent id.** Give internal agents a stable `role` instead: git pusher
+  is `completion-detector`, the injected stop-only detector is `orchestrator`.
+- Mixed-provider `--docker` is rejected in preflight (deferred, not a bug).
+- The module is pure — it takes `settings` as an argument and never reads disk, which
+  is what lets `lib/settings.js` require it without a cycle. Keep it that way.
 
 ### Logic Script API
 

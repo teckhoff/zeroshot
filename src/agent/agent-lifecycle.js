@@ -18,7 +18,7 @@ const IsolationManager = require('../isolation-manager');
 const crypto = require('crypto');
 const { bufferMessage, scheduleDrain, drainBufferedMessages } = require('../message-buffer');
 const { isPlatformSupported } = require('./agent-stuck-detector');
-const { normalizeProviderName } = require('../../lib/provider-names');
+const { resolveAgentProvider } = require('../provider-routing');
 const { loadSettings } = require('../../lib/settings');
 const { findPlatformMismatchReason } = require('./validation-platform');
 const { calculateRateLimitDelay, isRateLimitError } = require('./rate-limit-backoff');
@@ -58,13 +58,13 @@ async function createValidatorIsolation(agent, isolationConfig) {
 
   const cluster = agent.cluster || {};
   const workDir = agent.config?.cwd || cluster.worktree?.path || cluster.cwd || process.cwd();
-  const providerName = normalizeProviderName(
-    (agent._resolveProvider && agent._resolveProvider()) ||
-      cluster.config?.forceProvider ||
-      cluster.config?.defaultProvider ||
-      loadSettings().defaultProvider ||
-      'claude'
-  );
+  const providerName =
+    agent._resolveProvider?.() ??
+    resolveAgentProvider({
+      agent: { ...agent.config, role: agent.role },
+      clusterConfig: cluster.config || {},
+      settings: loadSettings(),
+    }).provider;
   // Run validators on the provider's image variant (installs its CLI as a Docker-cached layer).
   const image = IsolationManager.imageForProvider(providerName, isolationConfig.image);
   await IsolationManager.ensureImage(image, true, IsolationManager.providerBuildArgs(providerName));

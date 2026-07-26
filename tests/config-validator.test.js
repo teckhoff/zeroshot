@@ -21,6 +21,7 @@ const {
   extractTemplateVariables,
   extractSchemaProperties,
   validateAgentTemplateVariables,
+  validateProviderFeatures,
 } = require('../src/config-validator');
 
 // === BASIC STRUCTURE TESTS ===
@@ -880,6 +881,127 @@ describe('validateConfig (full)', function () {
     const result = validateConfig(brokenConfig);
     assert.strictEqual(result.valid, false);
     assert.ok(result.errors.length >= 3); // At least: missing id, missing role, empty triggers
+  });
+});
+
+// === ROLE-BASED PROVIDER ROUTING ===
+
+describe('validateProviderFeatures - providerByRole', function () {
+  const baseSettings = { defaultProvider: 'claude', providerSettings: {} };
+
+  function mixedConfig(overrides = {}) {
+    return {
+      defaultProvider: 'claude',
+      providerByRole: { planning: 'codex', implementation: 'claude', validator: 'gemini' },
+      agents: [
+        { id: 'planner', role: 'planning', modelLevel: 'level3' },
+        { id: 'worker', role: 'implementation', modelLevel: 'level2' },
+        { id: 'validator-requirements', role: 'validator', modelLevel: 'level2' },
+      ],
+      ...overrides,
+    };
+  }
+
+  it('accepts a valid mixed-provider config', function () {
+    const result = validateProviderFeatures(mixedConfig(), baseSettings);
+    assert.deepStrictEqual(result.errors, []);
+  });
+
+  it('reports an actionable error for an unknown provider in the map', function () {
+    const result = validateProviderFeatures(
+      mixedConfig({ providerByRole: { validator: 'not-a-provider' } }),
+      baseSettings
+    );
+    const error = result.errors.find((e) => e.includes('providerByRole.validator'));
+    assert.ok(error, `Expected a providerByRole error, got: ${result.errors.join(', ')}`);
+    assert.match(error, /unknown provider "not-a-provider"/);
+    assert.match(error, /Choose one of: .*claude/);
+  });
+
+  it('rejects a non-object providerByRole', function () {
+    const result = validateProviderFeatures(mixedConfig({ providerByRole: 'codex' }), baseSettings);
+    assert.ok(result.errors.some((e) => /providerByRole must be an object/.test(e)));
+  });
+
+  it('reports capability problems against the role-resolved provider', function () {
+    // gemini does not support reasoningEffort; the validator only knows that
+    // because the validator role routes to gemini.
+    const config = mixedConfig();
+    config.agents[2].reasoningEffort = 'high';
+
+    const result = validateProviderFeatures(config, baseSettings);
+    assert.ok(
+      result.warnings.some(
+        (w) =>
+          w.includes('validator-requirements') &&
+          w.includes('gemini') &&
+          w.includes('reasoningEffort')
+      ),
+      `Expected a gemini reasoningEffort warning, got: ${result.warnings.join(', ')}`
+    );
+  });
+
+  it('reports jsonSchema support against the role-resolved provider', function () {
+    const config = mixedConfig();
+    config.agents[0].jsonSchema = { type: 'object' };
+
+    const result = validateProviderFeatures(config, baseSettings);
+    const planningWarnings = result.warnings.filter((w) => w.includes('"planner"'));
+    for (const warning of planningWarnings) {
+      assert.ok(
+        !warning.includes('claude'),
+        `Planner warnings must reference codex, not claude: ${warning}`
+      );
+    }
+  });
+
+  it('uses the settings role map when the cluster does not define one', function () {
+    const config = mixedConfig({ providerByRole: undefined });
+    config.agents[2].reasoningEffort = 'high';
+
+    const result = validateProviderFeatures(config, {
+      ...baseSettings,
+      providerByRole: { validator: 'gemini' },
+    });
+    assert.ok(
+      result.warnings.some((w) => w.includes('validator-requirements') && w.includes('gemini'))
+    );
+  });
+
+  it('explicit agent providers still win over the role map', function () {
+    const config = mixedConfig();
+    config.agents[2].provider = 'claude';
+    config.agents[2].reasoningEffort = 'high';
+
+    const result = validateProviderFeatures(config, baseSettings);
+    assert.ok(
+      !result.warnings.some(
+        (w) => w.includes('validator-requirements') && w.includes('reasoningEffort')
+      ),
+      'claude supports reasoningEffort, so no warning is expected'
+    );
+  });
+
+  it('forceProvider collapses every agent back to one provider', function () {
+    const config = mixedConfig({ forceProvider: 'claude' });
+    config.agents[2].provider = 'gemini';
+    config.agents[2].reasoningEffort = 'high';
+
+    const result = validateProviderFeatures(config, baseSettings);
+    assert.ok(
+      !result.warnings.some((w) => w.includes('gemini')),
+      `forceProvider must override the role map: ${result.warnings.join(', ')}`
+    );
+  });
+
+  it('leaves configs without any role map behaving as before', function () {
+    const config = {
+      defaultProvider: 'claude',
+      agents: [{ id: 'worker', role: 'implementation', modelLevel: 'level2' }],
+    };
+    const result = validateProviderFeatures(config, baseSettings);
+    assert.deepStrictEqual(result.errors, []);
+    assert.deepStrictEqual(result.warnings, []);
   });
 });
 

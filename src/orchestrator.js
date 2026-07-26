@@ -47,6 +47,11 @@ const configValidator = require('./config-validator');
 const TemplateResolver = require('./template-resolver');
 const { loadSettings } = require('../lib/settings');
 const { normalizeProviderName } = require('../lib/provider-names');
+const {
+  formatRoutingSummary,
+  resolveAgentProvider,
+  resolveDefaultProvider,
+} = require('./provider-routing');
 const { resolveRunPlan } = require('../lib/run-plan');
 const { isProcessRunning } = require('../lib/process-liveness');
 const { getProvider } = require('./providers');
@@ -290,12 +295,7 @@ class Orchestrator {
    * @private
    */
   _resolveClusterProvider(clusterConfig = {}, settings = loadSettings()) {
-    const resolved =
-      clusterConfig.forceProvider ||
-      clusterConfig.defaultProvider ||
-      settings.defaultProvider ||
-      'claude';
-    return normalizeProviderName(resolved) || 'claude';
+    return resolveDefaultProvider({ clusterConfig, settings });
   }
 
   /**
@@ -307,7 +307,13 @@ class Orchestrator {
    */
   _resolveCompletionDetectorLevel(clusterConfig = {}) {
     const settings = loadSettings();
-    const providerName = this._resolveClusterProvider(clusterConfig, settings);
+    // Internal completion agents declare role `orchestrator`, so they follow the
+    // same role policy as any other agent.
+    const { provider: providerName } = resolveAgentProvider({
+      agent: { role: 'orchestrator' },
+      clusterConfig,
+      settings,
+    });
     const provider = getProvider(providerName);
     const providerSettings = settings.providerSettings?.[providerName] || {};
 
@@ -1489,6 +1495,21 @@ class Orchestrator {
 
       cluster.agents.push(agent);
     }
+
+    this._logProviderRouting(cluster, config);
+  }
+
+  /**
+   * Log one concise provider routing summary. Never logs settings or auth values.
+   * @private
+   */
+  _logProviderRouting(cluster, config) {
+    const routes = cluster.agents
+      .filter((agent) => typeof agent._resolveProviderRouting === 'function')
+      .map((agent) => agent._resolveProviderRouting());
+    this._log(
+      `    [provider] ${formatRoutingSummary(routes, this._resolveClusterProvider(config))}`
+    );
   }
 
   _subscribeToClusterTopic(messageBus, clusterId, topic, handler) {
