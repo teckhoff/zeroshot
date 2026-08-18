@@ -9,6 +9,16 @@
 
 const HTML_COMMENT_RE = /<!--[\s\S]*?-->/g;
 
+function stripHtmlComments(input) {
+  let current = input;
+  let previous;
+  do {
+    previous = current;
+    current = current.replace(HTML_COMMENT_RE, '');
+  } while (current !== previous);
+  return current;
+}
+
 function normalizeNewlines(markdown) {
   return markdown.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
@@ -169,7 +179,7 @@ function extractHeadings(markdown) {
 function sectionVisibleContent(markdown, heading) {
   const normalized = normalizeNewlines(String(markdown ?? ''));
   const slice = normalized.slice(heading.contentStart, heading.contentEnd);
-  const withoutComments = slice.replace(HTML_COMMENT_RE, '');
+  const withoutComments = stripHtmlComments(slice);
   return withoutComments.trim();
 }
 
@@ -179,7 +189,7 @@ function sectionVisibleContent(markdown, heading) {
  */
 function wholeDocumentVisibleContent(markdown) {
   const normalized = normalizeNewlines(String(markdown ?? ''));
-  return normalized.replace(HTML_COMMENT_RE, '').trim();
+  return stripHtmlComments(normalized).trim();
 }
 
 module.exports = {
