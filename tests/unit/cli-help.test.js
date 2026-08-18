@@ -234,6 +234,7 @@ describe('CLI completion snapshots', function () {
       '--ship',
       '--pr-base',
       '--pr-body',
+      '--pr-body-template-file',
       '--merge-queue',
       '--close-issue',
       '--provider',

@@ -10,269 +10,7 @@
  * - Prompt template with platform-specific commands
  */
 
-/**
- * Shared trigger logic for detecting when all validators have approved.
- * This is the SINGLE source of truth - no more duplicating across 3 JSON files.
- */
-const SHARED_TRIGGER_SCRIPT = `const validators = cluster.getAgentsByRole('validator');
-const lastPush = ledger.findLast({ topic: 'IMPLEMENTATION_READY' });
-if (!lastPush) return false;
-
-function isApproved(value) {
-  return value === true || value === 'true';
-}
-
-function getPayload(msg) {
-  return msg?.content?.['data'] || {};
-}
-
-function getEvidence(gate) {
-  return gate?.evidence && typeof gate.evidence === 'object' ? gate.evidence : {};
-}
-
-function getGateId(gate) {
-  if (typeof gate?.id === 'string' && gate.id.trim() !== '') return gate.id.trim();
-  const gateName = gate?.['name'];
-  if (typeof gateName === 'string' && gateName.trim() !== '') return gateName.trim();
-  return null;
-}
-
-function normalizeGateRequirements(value) {
-  if (!Array.isArray(value)) return [];
-  const normalized = [];
-  for (const gate of value) {
-    if (typeof gate === 'string') {
-      const id = gate.trim();
-      if (id) normalized.push({ id });
-      continue;
-    }
-    if (!gate || typeof gate !== 'object') continue;
-    const id = getGateId(gate);
-    if (!id) continue;
-    const required = { id };
-    if (typeof gate.scope === 'string' && gate.scope.trim() !== '') {
-      required.scope = gate.scope.trim();
-    }
-    normalized.push(required);
-  }
-  return normalized;
-}
-
-function getRequiredQualityGates() {
-  const currentAgent =
-    typeof cluster.getAgent === 'function' ? cluster.getAgent(agent.id) : null;
-  const sources = [
-    agent.requiredQualityGates,
-    currentAgent?.requiredQualityGates,
-    currentAgent?.config?.requiredQualityGates,
-  ];
-  for (const source of sources) {
-    const gates = normalizeGateRequirements(source);
-    if (gates.length > 0) return gates;
-  }
-  return [];
-}
-
-function collectQualityGates(msg) {
-  const gateData = getPayload(msg);
-  return Array.isArray(gateData.qualityGates) ? gateData.qualityGates : [];
-}
-
-function toTimestamp(timestampInput) {
-  const value = timestampInput;
-  if (typeof value === 'number' && isFinite(value)) return value;
-  if (typeof value === 'string' && value.trim() !== '') {
-    const numeric = Number(value);
-    if (isFinite(numeric)) return numeric;
-    const parsed = Date.parse(value);
-    if (isFinite(parsed)) return parsed;
-  }
-  return null;
-}
-
-function qualityGateTimestamp(gate, msg) {
-  const evidence = getEvidence(gate);
-  return (
-    toTimestamp(gate?.timestamp) ||
-    toTimestamp(gate?.validatedAt) ||
-    toTimestamp(gate?.completedAt) ||
-    toTimestamp(evidence.timestamp) ||
-    toTimestamp(evidence.validatedAt) ||
-    toTimestamp(evidence.completedAt)
-  );
-}
-
-function describeQualityGate(gate, msg, required) {
-  const evidence = getEvidence(gate);
-  const parts = [];
-  const gateId = getGateId(gate) || required?.id;
-  const scope = gate?.scope || evidence.scope || required?.scope;
-  const status = gate?.status;
-  const exitCode = evidence.exitCode;
-  const command = evidence.command;
-  const output = evidence.output || gate?.reason || evidence.reason;
-  if (gateId) parts.push('gate=' + gateId);
-  if (scope) parts.push('scope=' + scope);
-  if (status) parts.push('status=' + status);
-  if (exitCode !== undefined) parts.push('exitCode=' + exitCode);
-  if (command) parts.push('command=' + JSON.stringify(String(command).slice(0, 160)));
-  if (msg?.sender) parts.push('sender=' + msg.sender);
-  if (output) parts.push('output=' + JSON.stringify(String(output).slice(0, 240)));
-  if (!output && (gate?.reason || evidence.reason)) {
-    parts.push('reason=' + JSON.stringify(String(gate?.reason || evidence.reason).slice(0, 240)));
-  }
-  return parts.join(' ');
-}
-
-function exitCodePasses(evidence) {
-  const exitCode = evidence.exitCode;
-  return (
-    exitCode === 0 ||
-    exitCode === '0' ||
-    (typeof exitCode === 'string' && exitCode.trim() !== '' && Number(exitCode) === 0)
-  );
-}
-
-function qualityGateMatches(gate, required) {
-  if (getGateId(gate) !== required.id) return false;
-  if (required.scope && gate?.scope !== required.scope && getEvidence(gate).scope !== required.scope) {
-    return false;
-  }
-  return true;
-}
-
-function compareGateEvidence(left, right) {
-  const leftTimestamp = qualityGateTimestamp(left.gate, left.msg) || 0;
-  const rightTimestamp = qualityGateTimestamp(right.gate, right.msg) || 0;
-  return leftTimestamp - rightTimestamp;
-}
-
-function findLatestQualityGate(messages, required) {
-  let latest = null;
-  for (const msg of messages) {
-    for (const gate of collectQualityGates(msg)) {
-      if (!qualityGateMatches(gate, required)) continue;
-      const candidate = { gate, msg };
-      if (!latest || compareGateEvidence(candidate, latest) >= 0) {
-        latest = candidate;
-      }
-    }
-  }
-  return latest;
-}
-
-function getQualityGateBlockingReasons(gate, msg) {
-  const reasons = [];
-  const status = String(gate?.status || '').toUpperCase();
-  if (status !== 'PASS') reasons.push('status=' + (gate?.status || 'missing'));
-
-  const evidence = getEvidence(gate);
-  if (typeof evidence.command !== 'string' || evidence.command.trim() === '') {
-    reasons.push('missing evidence.command');
-  }
-  if (!exitCodePasses(evidence)) {
-    reasons.push('evidence.exitCode=' + evidence.exitCode);
-  }
-  if (typeof evidence.output !== 'string') {
-    reasons.push('missing evidence.output');
-  }
-  if (gate?.stale === true || evidence.stale === true) {
-    reasons.push('stale=true');
-  }
-  const completedAt = qualityGateTimestamp(gate, msg);
-  if (completedAt === null) {
-    reasons.push('missing completedAt');
-  } else if (completedAt < lastPush.timestamp) {
-    reasons.push('completed before IMPLEMENTATION_READY');
-  }
-  return reasons;
-}
-
-function assertRequiredQualityGatesPass(messages) {
-  if (requiredQualityGatesForHandoff.length === 0) return true;
-
-  for (const required of requiredQualityGatesForHandoff) {
-    const found = findLatestQualityGate(messages, required);
-    if (!found) {
-      throw new Error(
-        'Required quality gate missing for git-pusher handoff: gate=' + required.id
-      );
-    }
-
-    const reasons = getQualityGateBlockingReasons(found.gate, found.msg);
-    if (reasons.length > 0) {
-      throw new Error(
-        'Required quality gate blocked git-pusher handoff: ' +
-          describeQualityGate(found.gate, found.msg, required) +
-          ' reason=' +
-          JSON.stringify(reasons.join(', '))
-      );
-    }
-  }
-
-  return true;
-}
-
-const requiredQualityGatesForHandoff = getRequiredQualityGates();
-if (validators.length === 0 && requiredQualityGatesForHandoff.length === 0) return true;
-
-const results = ledger.query({ topic: 'VALIDATION_RESULT', since: lastPush.timestamp });
-if (results.length === 0) return false;
-
-const validatorIds = new Set(validators.map((v) => v.id));
-const validatorResults = results.filter((r) => validatorIds.has(r.sender));
-
-// Two supported patterns:
-// 1) Per-validator VALIDATION_RESULT (sender is a validator) → require all validators approve.
-// 2) Consensus-only VALIDATION_RESULT (sender is coordinator) -> use latest result.
-if (validatorResults.length === 0) {
-  let latest = null;
-  for (const msg of results) {
-    if (!latest || (typeof msg.timestamp === 'number' && msg.timestamp > latest.timestamp)) {
-      latest = msg;
-    }
-  }
-  const approved = getPayload(latest).approved;
-  if (!isApproved(approved)) return false;
-  assertRequiredQualityGatesPass([latest]);
-  return true;
-}
-
-const latestByValidator = new Map();
-for (const msg of validatorResults) {
-  latestByValidator.set(msg.sender, msg);
-}
-if (latestByValidator.size < validators.length) return false;
-
-for (const validator of validators) {
-  const msg = latestByValidator.get(validator.id);
-  const approved = getPayload(msg).approved;
-  if (!isApproved(approved)) return false;
-}
-
-const latestValidatorMessages = Array.from(latestByValidator.values());
-assertRequiredQualityGatesPass(latestValidatorMessages);
-
-const hasSufficientEvidence = latestValidatorMessages.every((r) => {
-  const criteria = getPayload(r).criteriaResults;
-  if (!Array.isArray(criteria) || criteria.length === 0) return true;
-  return criteria.every((c) => {
-    const status = String(c.status || '').toUpperCase();
-    if (status === 'CANNOT_VALIDATE') return true;
-    if (status === 'SKIPPED') return true;
-    if (status === 'CANNOT_VALIDATE_YET') return false;
-    const evidence = c.evidence || {};
-    const hasCommand = typeof evidence.command === 'string' && evidence.command.trim().length > 0;
-    const exitCode = evidence.exitCode;
-    const hasExitCode =
-      typeof exitCode === 'number' ||
-      (typeof exitCode === 'string' && exitCode.trim() !== '' && isFinite(Number(exitCode)));
-    const hasOutput = evidence.output === undefined || typeof evidence.output === 'string';
-    return hasCommand && hasExitCode && hasOutput;
-  });
-});
-
-return hasSufficientEvidence;`;
+const { SHARED_TRIGGER_SCRIPT } = require('./git-pusher-trigger-script');
 
 const { readRepoSettings } = require('../../lib/repo-settings');
 const { normalizeGitRemoteName, quoteShellArgument } = require('../../lib/git-remote-utils');
@@ -598,38 +336,24 @@ If blocked before creating a ${prName}, output:
 }
 
 /**
- * Generate the prompt for a specific platform
+ * Generate the STEP 6 (merge/auto-complete) and STEP 7 (close-issue) prompt
+ * sections shared by the git-pusher's ship-mode prompt and the standalone
+ * pr-merger agent used by template-file mode.
  * @param {Object} config - Platform configuration from PLATFORM_CONFIGS
- * @returns {string} The complete prompt with platform-specific commands
+ * @returns {string} The merge and close-issue prompt sections
  */
-function generatePrompt(config) {
+function generateMergeSteps(config) {
   const {
     prName,
-    createCmd,
     mergeCmd,
     mergeFallbackCmd,
-    prUrlExample,
-    outputFields,
     requiresPrIdExtraction,
-    rebaseBranch,
     usesMergeQueue,
     closeIssueMode,
-    autoMerge,
+    rebaseBranch,
     issueContext,
   } = config;
   const issueNumberArgument = quoteShellArgument(issueContext.issueNumber);
-
-  if (!autoMerge) {
-    return generateReviewModePrompt(config);
-  }
-
-  // Azure-specific instructions for PR ID extraction
-  const azurePrIdNote = requiresPrIdExtraction
-    ? `\n\n💡 IMPORTANT: The output will contain the PR ID. You MUST extract it for the next step.
-Look for output like: "Created PR 123" or parse the URL for the PR number.
-Save the PR ID to a variable for step 6.`
-    : '';
-  const deliverySteps = generateDeliverySteps(config, azurePrIdNote);
 
   // Azure uses different merge terminology
   const mergeDescription = requiresPrIdExtraction
@@ -649,48 +373,7 @@ If auto-complete is not available or you need to merge immediately:`
 If enqueue fails (merge queue not enabled, missing permissions, etc.), fall back to auto-merge:`
       : `This merges the ${prName} directly and deletes the remote branch. If it fails, try without branch deletion:`;
 
-  const finalOutputNote = requiresPrIdExtraction
-    ? `ONLY after the PR is created and auto-complete is set, output:
-\`\`\`json
-{"${outputFields.urlField}": "${prUrlExample}", "${outputFields.numberField}": 123, "merged": false, "auto_complete": true}
-\`\`\`
-
-If truly no changes exist, output:
-\`\`\`json
-{"${outputFields.urlField}": null, "${outputFields.numberField}": null, "merged": false, "auto_complete": false}
-\`\`\``
-    : `ONLY after the ${prName} is MERGED, output:
-\`\`\`json
-{"${outputFields.urlField}": "${prUrlExample}", "${outputFields.numberField}": 123, "merged": true}
-\`\`\`
-
-If truly no changes exist, output:
-\`\`\`json
-{"${outputFields.urlField}": null, "${outputFields.numberField}": null, "merged": false}
-\`\`\``;
-
-  return `CRITICAL: ALL VALIDATORS APPROVED. YOU ARE A TRANSPORT-ONLY GIT PUSHER.
-
-Your job is to preserve validator ownership: stage, commit, push, create the ${prName}, then merge or enable auto-merge when possible.
-
-Do NOT edit source files, tests, configs, generated artifacts, or lockfiles.
-Do NOT inspect CI logs to debug product code.
-Do NOT resolve merge conflicts or rebase conflicts.
-Do NOT run implementation/debugging workflows after validators hand off.
-
-Allowed after validation:
-- git add/status/commit/push
-- ${createCmd.split(' ').slice(0, 3).join(' ')}
-- ${mergeCmd.split(' ').slice(0, 4).join(' ')} or auto-merge/auto-complete commands
-- status-only commands such as ${prName === 'PR' ? 'gh pr view/gh pr checks' : 'the platform PR/MR status command'}
-
-If commit hooks, push, ${prName} creation, merge, CI, or conflict handling requires code changes, STOP and report the blocked state in JSON. The implementation and validator agents must fix code and rerun quality gates.
-
-## MANDATORY STEPS - EXECUTE EACH ONE IN ORDER - DO NOT SKIP ANY STEP
-
-${deliverySteps}
-
-⚠️ AFTER ${prName} CREATION YOU ARE NOT DONE! CONTINUE TO STEP 6! ⚠️
+  return `⚠️ AFTER ${prName} CREATION YOU ARE NOT DONE! CONTINUE TO STEP 6! ⚠️
 
 ### STEP 6: ${mergeDescription}
 \`\`\`bash
@@ -735,7 +418,79 @@ fi
 \`\`\`
 Only do this AFTER the ${prName} is merged.`
     : ''
+}`;
 }
+
+/**
+ * Generate the prompt for a specific platform
+ * @param {Object} config - Platform configuration from PLATFORM_CONFIGS
+ * @returns {string} The complete prompt with platform-specific commands
+ */
+function generatePrompt(config) {
+  const {
+    prName,
+    createCmd,
+    mergeCmd,
+    prUrlExample,
+    outputFields,
+    requiresPrIdExtraction,
+    autoMerge,
+  } = config;
+
+  if (!autoMerge) {
+    return generateReviewModePrompt(config);
+  }
+
+  // Azure-specific instructions for PR ID extraction
+  const azurePrIdNote = requiresPrIdExtraction
+    ? `\n\n💡 IMPORTANT: The output will contain the PR ID. You MUST extract it for the next step.
+Look for output like: "Created PR 123" or parse the URL for the PR number.
+Save the PR ID to a variable for step 6.`
+    : '';
+  const deliverySteps = generateDeliverySteps(config, azurePrIdNote);
+
+  const finalOutputNote = requiresPrIdExtraction
+    ? `ONLY after the PR is created and auto-complete is set, output:
+\`\`\`json
+{"${outputFields.urlField}": "${prUrlExample}", "${outputFields.numberField}": 123, "merged": false, "auto_complete": true}
+\`\`\`
+
+If truly no changes exist, output:
+\`\`\`json
+{"${outputFields.urlField}": null, "${outputFields.numberField}": null, "merged": false, "auto_complete": false}
+\`\`\``
+    : `ONLY after the ${prName} is MERGED, output:
+\`\`\`json
+{"${outputFields.urlField}": "${prUrlExample}", "${outputFields.numberField}": 123, "merged": true}
+\`\`\`
+
+If truly no changes exist, output:
+\`\`\`json
+{"${outputFields.urlField}": null, "${outputFields.numberField}": null, "merged": false}
+\`\`\``;
+
+  return `CRITICAL: ALL VALIDATORS APPROVED. YOU ARE A TRANSPORT-ONLY GIT PUSHER.
+
+Your job is to preserve validator ownership: stage, commit, push, create the ${prName}, then merge or enable auto-merge when possible.
+
+Do NOT edit source files, tests, configs, generated artifacts, or lockfiles.
+Do NOT inspect CI logs to debug product code.
+Do NOT resolve merge conflicts or rebase conflicts.
+Do NOT run implementation/debugging workflows after validators hand off.
+
+Allowed after validation:
+- git add/status/commit/push
+- ${createCmd.split(' ').slice(0, 3).join(' ')}
+- ${mergeCmd.split(' ').slice(0, 4).join(' ')} or auto-merge/auto-complete commands
+- status-only commands such as ${prName === 'PR' ? 'gh pr view/gh pr checks' : 'the platform PR/MR status command'}
+
+If commit hooks, push, ${prName} creation, merge, CI, or conflict handling requires code changes, STOP and report the blocked state in JSON. The implementation and validator agents must fix code and rerun quality gates.
+
+## MANDATORY STEPS - EXECUTE EACH ONE IN ORDER - DO NOT SKIP ANY STEP
+
+${deliverySteps}
+
+${generateMergeSteps(config)}
 
 ## CRITICAL RULES
 - Execute EVERY step in order (1, 2, 3, 4, 5, 6)
@@ -820,24 +575,137 @@ function generateGitPusherAgent(platform, options = {}) {
       topic: 'PR_CREATED',
       publishAfter: 'CLUSTER_COMPLETE',
     },
-    structuredOutput: {
-      type: 'object',
-      properties: {
-        pr_number: {
-          type: 'number',
-          description: 'MUST extract from gh pr create output - NOT from git push link',
-        },
-        pr_url: { type: 'string' },
-        merged: { type: 'boolean' },
-        merge_commit_sha: {
-          type: 'string',
-          description: 'MUST extract from gh pr merge output',
-        },
-        blocked: { type: 'boolean' },
-        blocked_reason: { type: 'string' },
+    structuredOutput: gitPusherStructuredOutputSchema(),
+  };
+}
+
+/**
+ * Shared structured-output schema for both the git-pusher and the pr-merger
+ * (template-file mode's merge-only agent).
+ * @returns {Object} JSON schema
+ */
+function gitPusherStructuredOutputSchema() {
+  return {
+    type: 'object',
+    properties: {
+      pr_number: {
+        type: 'number',
+        description: 'MUST extract from gh pr create output - NOT from git push link',
       },
-      required: ['pr_number', 'pr_url', 'merged'],
+      pr_url: { type: 'string' },
+      merged: { type: 'boolean' },
+      merge_commit_sha: {
+        type: 'string',
+        description: 'MUST extract from gh pr merge output',
+      },
+      blocked: { type: 'boolean' },
+      blocked_reason: { type: 'string' },
     },
+    required: ['pr_number', 'pr_url', 'merged'],
+  };
+}
+
+/**
+ * Generate the merge-only prompt for the pr-merger agent (template-file
+ * mode). The PR/MR already exists with a verified, approved body; this
+ * agent's only job is to merge it (or enable auto-merge/auto-complete) and
+ * close the linked issue if configured.
+ * @param {Object} config - Platform configuration from PLATFORM_CONFIGS
+ * @returns {string} The complete merge-only prompt
+ */
+function generatePrMergerPrompt(config) {
+  const { prName, mergeCmd, outputFields, requiresPrIdExtraction, prUrlExample } = config;
+
+  const finalOutputNote = requiresPrIdExtraction
+    ? `ONLY after auto-complete is set, output:
+\`\`\`json
+{"${outputFields.urlField}": "${prUrlExample}", "${outputFields.numberField}": 123, "merged": false, "auto_complete": true}
+\`\`\``
+    : `ONLY after the ${prName} is MERGED, output:
+\`\`\`json
+{"${outputFields.urlField}": "${prUrlExample}", "${outputFields.numberField}": 123, "merged": true}
+\`\`\``;
+
+  return `CRITICAL: PR METADATA VERIFIED. YOU ARE A TRANSPORT-ONLY MERGE AGENT.
+
+The ${prName} already exists with an approved body that has been verified against what the
+platform actually published. Your ONLY job is to merge it (or enable auto-merge/auto-complete)
+and close the linked issue if configured.
+
+Do NOT create a new ${prName} - it already exists.
+Do NOT edit source files, tests, configs, generated artifacts, or lockfiles.
+Do NOT inspect CI logs to debug product code.
+Do NOT resolve merge conflicts or rebase conflicts.
+Do NOT run implementation/debugging workflows.
+
+Allowed:
+- ${mergeCmd.split(' ').slice(0, 4).join(' ')} or auto-merge/auto-complete commands
+- status-only commands such as ${prName === 'PR' ? 'gh pr view/gh pr checks' : 'the platform PR/MR status command'}
+
+If merge, CI, or conflict handling requires code changes, STOP and report the blocked state in JSON.
+The implementation and validator agents must fix code and rerun quality gates.
+
+## MANDATORY STEPS - EXECUTE EACH ONE IN ORDER - DO NOT SKIP ANY STEP
+
+${generateMergeSteps(config)}
+
+## CRITICAL RULES
+- Do NOT create a new ${prName} - it already exists with a verified body
+- Do NOT edit files
+- Do NOT debug product failures
+- If merge or CI fails, report it instead of fixing code
+- Output JSON only after the ${prName} is merged, auto-merge is enabled/pending, or a non-code transport failure blocks progress
+
+## Final Output
+${finalOutputNote}
+
+If blocked, output:
+\`\`\`json
+{"${outputFields.urlField}": "${prUrlExample}", "${outputFields.numberField}": 123, "merged": false, "blocked": true, "blocked_reason": "ci_failed: test job failed"}
+\`\`\``;
+}
+
+/**
+ * Generate the pr-merger agent configuration (template-file mode only).
+ * Triggers once verifyPrMetadata publishes PR_METADATA_VERIFIED, confirming
+ * the platform stored the approved body/base before any merge action.
+ *
+ * @param {string} platform - Platform ID ('github', 'gitlab', 'azure-devops')
+ * @param {Object} [options] - Same CLI options accepted by generateGitPusherAgent
+ * @returns {Object} Agent configuration object
+ * @throws {Error} If platform is not supported
+ */
+function generatePrMergerAgent(platform, options = {}) {
+  const resolvedConfig = resolveGitHubConfig(options);
+  const platformConfig = getPlatformConfig(platform, resolvedConfig);
+
+  if (!platformConfig) {
+    const supported = SUPPORTED_PLATFORMS.join(', ');
+    throw new Error(`Unsupported platform '${platform}'. Supported: ${supported}`);
+  }
+
+  return {
+    id: 'pr-merger',
+    role: 'completion-detector',
+    modelLevel: 'level2',
+    triggers: [
+      {
+        topic: 'PR_METADATA_VERIFIED',
+        action: 'execute_task',
+      },
+    ],
+    prompt: generatePrMergerPrompt(platformConfig),
+    hooks: {
+      onComplete: {
+        action: 'verify_pull_request',
+        config: { autoMerge: true },
+      },
+    },
+    output: {
+      topic: 'PR_CREATED',
+      publishAfter: 'CLUSTER_COMPLETE',
+    },
+    structuredOutput: gitPusherStructuredOutputSchema(),
   };
 }
 
@@ -860,6 +728,7 @@ function isPlatformSupported(platform) {
 
 module.exports = {
   generateGitPusherAgent,
+  generatePrMergerAgent,
   getSupportedPlatforms,
   isPlatformSupported,
   // Export for testing

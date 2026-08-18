@@ -58,7 +58,8 @@ class Ledger extends EventEmitter {
   }
 
   _initSchema() {
-    const journalMode = (process.env.ZEROSHOT_SQLITE_JOURNAL_MODE || 'WAL').trim().toUpperCase();
+    const journalModeEnv = process.env.ZEROSHOT_SQLITE_JOURNAL_MODE;
+    const journalMode = (journalModeEnv ? journalModeEnv : 'WAL').trim().toUpperCase();
     // Enable WAL mode for concurrent reads (default), but allow overrides for network filesystems.
     this.db.pragma(`journal_mode = ${journalMode}`);
     // Force synchronous writes so other processes see changes immediately
@@ -653,8 +654,9 @@ class Ledger extends EventEmitter {
    * @returns {Array} Guidance messages ordered by durable message sequence ASC
    */
   queryGuidanceMailbox(criteria) {
-    const { cluster_id, target_agent_id, lastDeliveredAt, afterId, throughId, limit } =
-      criteria || {};
+    const { cluster_id, target_agent_id, lastDeliveredAt, afterId, throughId, limit } = criteria
+      ? criteria
+      : {};
 
     if (!cluster_id) {
       throw new Error('cluster_id is required for guidance mailbox queries');
@@ -910,7 +912,7 @@ class Ledger extends EventEmitter {
 
     for (const row of rows) {
       const message = this._deserializeMessage(row);
-      const data = message.content?.data || {};
+      const data = message.content?.data ? message.content.data : {};
       const role = data.role || 'unknown';
 
       // Initialize role bucket if needed

@@ -17,6 +17,7 @@ const IsolationManager = require('../src/isolation-manager.js');
 const MockTaskRunner = require('./helpers/mock-task-runner.js');
 const LedgerAssertions = require('./helpers/ledger-assertions.js');
 const Ledger = require('../src/ledger.js');
+const MessageBus = require('../src/message-bus.js');
 const { promptIdentity } = require('../src/agent/provider-session.js');
 const { runStructuredOutputRecovery } = require('./helpers/stuck-recovery-fixture');
 
@@ -2402,6 +2403,52 @@ describe('Orchestrator - Crash Recovery (CRITICAL)', function () {
 
     orchestrator.close();
   });
+
+  it('rejects an unknown prBodyMode on load (downgrade protection) while still loading valid clusters', async function () {
+    const clustersFile = path.join(storageDir, 'clusters.json');
+    const futureClusterId = 'future-pr-body-mode-cluster';
+    const validClusterId = 'valid-cluster-2';
+    fs.writeFileSync(
+      clustersFile,
+      JSON.stringify({
+        [futureClusterId]: {
+          id: futureClusterId,
+          config: { agents: [] },
+          state: 'stopped',
+          prOptions: { prBodyMode: 'future-mode-from-a-newer-zeroshot', prBodyTemplate: null },
+        },
+        [validClusterId]: {
+          id: validClusterId,
+          config: { agents: [] },
+          state: 'stopped',
+          prOptions: {
+            prBodyMode: 'template-file',
+            prBodyTemplate: { sourcePath: 'x.md', content: '# X', sha256: 'a'.repeat(64) },
+          },
+        },
+      })
+    );
+
+    const futureLedger = new Ledger(path.join(storageDir, `${futureClusterId}.db`));
+    futureLedger.close();
+    const validLedger = new Ledger(path.join(storageDir, `${validClusterId}.db`));
+    validLedger.close();
+
+    const orchestrator = await Orchestrator.create({ storageDir, quiet: true });
+    const clusters = orchestrator.listClusters();
+
+    assert.ok(
+      !clusters.some((cluster) => cluster.id === futureClusterId),
+      'a cluster with an unknown prBodyMode must be rejected, not silently treated as legacy literal'
+    );
+    const loadedValid = clusters.find((cluster) => cluster.id === validClusterId);
+    assert.ok(loadedValid, 'a sibling cluster with a known prBodyMode must still load');
+
+    const validCluster = orchestrator.getCluster(validClusterId);
+    assert.strictEqual(validCluster.prOptions.prBodyMode, 'template-file');
+
+    orchestrator.close();
+  });
 });
 
 describe('Orchestrator - Concurrent Operations (Race Conditions)', function () {
@@ -2864,5 +2911,232 @@ describe('Codex planner structured-output recovery', function () {
     assert.strictEqual(result.clusterFailures[0].details.recoveryAttempts, 3);
     assert.strictEqual(result.failureInfo.code, 'STRUCTURED_OUTPUT_INVALID');
     assert.deepStrictEqual(result.failureInfo.details, result.clusterFailures[0].details);
+  });
+});
+
+describe('_injectPusherAfterPrBodyReady (pr-body-template-file mode)', function () {
+  const crypto = require('crypto');
+  const TEMPLATE_CONTENT = '## Problem\n\n{{issue_reference}}\n';
+  const TEMPLATE_SHA256 = crypto
+    .createHash('sha256')
+    .update(TEMPLATE_CONTENT, 'utf8')
+    .digest('hex');
+
+  let orchestratorInstance;
+  let storageDirLocal;
+  let capturedAddAgentsOps;
+
+  function makeCluster(clusterId) {
+    const ledger = new Ledger(':memory:');
+    const messageBus = new MessageBus(ledger);
+    return {
+      id: clusterId,
+      config: { agents: [] },
+      agents: [],
+      messageBus,
+      ledger,
+      gitPlatform: 'github',
+      worktree: null,
+      isolation: null,
+      modelOverride: null,
+      requiredQualityGates: [],
+      commandProofs: [],
+      autoPr: true,
+      prOptions: {
+        prBodyMode: 'template-file',
+        prBodyTemplate: {
+          sourcePath: '.github/pull_request_template.md',
+          content: TEMPLATE_CONTENT,
+          sha256: TEMPLATE_SHA256,
+        },
+        autoMerge: false,
+        prBase: 'main',
+        prBody: null,
+        gitRemote: 'origin',
+        closeIssue: null,
+        mergeQueue: false,
+      },
+    };
+  }
+
+  function appendMessage(cluster, topic, sender, data) {
+    return cluster.ledger.append({ cluster_id: cluster.id, topic, sender, content: { data } });
+  }
+
+  function prBodyReadyMessage({
+    templateSha256,
+    implementationCycleId,
+    canonicalBody = '## Problem\n\nClosed #1\n',
+    canonicalBodySha256 = 'digest-abc',
+  }) {
+    return {
+      topic: 'PR_BODY_READY',
+      content: {
+        data: {
+          templateSha256,
+          implementationCycleId,
+          canonicalBody,
+          canonicalBodySha256,
+          evidenceRefs: [],
+          sectionEvidence: [],
+          attemptCount: 1,
+        },
+      },
+    };
+  }
+
+  beforeEach(function () {
+    storageDirLocal = fs.mkdtempSync(path.join(os.tmpdir(), 'zeroshot-orch-prbody-test-'));
+    orchestratorInstance = new Orchestrator({
+      storageDir: storageDirLocal,
+      skipLoad: true,
+      quiet: true,
+    });
+    orchestratorInstance._log = () => {};
+    orchestratorInstance._saveClusters = async () => {};
+    capturedAddAgentsOps = [];
+    orchestratorInstance._opAddAgents = (cluster, op) => {
+      capturedAddAgentsOps.push(op);
+      for (const agentConfig of op.agents) {
+        cluster.config.agents.push(agentConfig);
+        cluster.agents.push({ id: agentConfig.id, config: agentConfig });
+      }
+    };
+  });
+
+  afterEach(function () {
+    cleanupTempDir(storageDirLocal);
+  });
+
+  it('does nothing when prBodyMode is not template-file', async function () {
+    const cluster = makeCluster('prbody-c1');
+    cluster.prOptions.prBodyMode = 'literal';
+    const implementationReady = appendMessage(cluster, 'IMPLEMENTATION_READY', 'worker', {});
+    const message = prBodyReadyMessage({
+      templateSha256: TEMPLATE_SHA256,
+      implementationCycleId: implementationReady.id,
+    });
+
+    await orchestratorInstance._injectPusherAfterPrBodyReady(cluster, message, {});
+
+    assert.strictEqual(capturedAddAgentsOps.length, 0);
+  });
+
+  it('ignores a stale template digest', async function () {
+    const cluster = makeCluster('prbody-c2');
+    const implementationReady = appendMessage(cluster, 'IMPLEMENTATION_READY', 'worker', {});
+    const message = prBodyReadyMessage({
+      templateSha256: 'wrong-digest',
+      implementationCycleId: implementationReady.id,
+    });
+
+    await orchestratorInstance._injectPusherAfterPrBodyReady(cluster, message, {});
+
+    assert.strictEqual(capturedAddAgentsOps.length, 0);
+  });
+
+  it('ignores a stale implementation cycle (superseded by a newer IMPLEMENTATION_READY)', async function () {
+    const cluster = makeCluster('prbody-c3');
+    const oldReady = appendMessage(cluster, 'IMPLEMENTATION_READY', 'worker', {});
+    appendMessage(cluster, 'IMPLEMENTATION_READY', 'worker', {}); // newer cycle supersedes oldReady
+    const message = prBodyReadyMessage({
+      templateSha256: TEMPLATE_SHA256,
+      implementationCycleId: oldReady.id,
+    });
+
+    await orchestratorInstance._injectPusherAfterPrBodyReady(cluster, message, {});
+
+    assert.strictEqual(capturedAddAgentsOps.length, 0);
+  });
+
+  it('injects a review-mode git-pusher with the approved body and verify_pr_metadata hook', async function () {
+    const cluster = makeCluster('prbody-c4');
+    const implementationReady = appendMessage(cluster, 'IMPLEMENTATION_READY', 'worker', {});
+    const message = prBodyReadyMessage({
+      templateSha256: TEMPLATE_SHA256,
+      implementationCycleId: implementationReady.id,
+      canonicalBody: '## Problem\n\nClosed #7\n',
+      canonicalBodySha256: 'sha-of-approved-body',
+    });
+
+    await orchestratorInstance._injectPusherAfterPrBodyReady(cluster, message, {});
+
+    assert.strictEqual(capturedAddAgentsOps.length, 1);
+    const [op] = capturedAddAgentsOps;
+    assert.strictEqual(op.agents.length, 1, 'autoMerge=false must not also add pr-merger');
+    const gitPusher = op.agents[0];
+    assert.strictEqual(gitPusher.id, 'git-pusher');
+    assert.ok(
+      gitPusher.prompt.includes('Closed #7'),
+      'prompt must carry the approved canonical body'
+    );
+    assert.deepStrictEqual(gitPusher.hooks, {
+      onComplete: {
+        action: 'verify_pr_metadata',
+        config: {
+          autoMerge: false,
+          shipHandoff: false,
+          expectedBodySha256: 'sha-of-approved-body',
+          expectedBase: 'main',
+        },
+      },
+    });
+  });
+
+  it('also injects pr-merger when the run is --ship (autoMerge=true), with shipHandoff=true', async function () {
+    const cluster = makeCluster('prbody-c5');
+    cluster.prOptions.autoMerge = true;
+    const implementationReady = appendMessage(cluster, 'IMPLEMENTATION_READY', 'worker', {});
+    const message = prBodyReadyMessage({
+      templateSha256: TEMPLATE_SHA256,
+      implementationCycleId: implementationReady.id,
+    });
+
+    await orchestratorInstance._injectPusherAfterPrBodyReady(cluster, message, {});
+
+    assert.strictEqual(capturedAddAgentsOps.length, 1);
+    const [op] = capturedAddAgentsOps;
+    assert.strictEqual(op.agents.length, 2);
+    assert.deepStrictEqual(
+      op.agents.map((a) => a.id),
+      ['git-pusher', 'pr-merger']
+    );
+    assert.strictEqual(op.agents[0].hooks.onComplete.config.shipHandoff, true);
+    assert.strictEqual(op.agents[1].triggers[0].topic, 'PR_METADATA_VERIFIED');
+  });
+
+  it('is idempotent: duplicate PR_BODY_READY messages and repeated evaluation add git-pusher exactly once', async function () {
+    const cluster = makeCluster('prbody-c6');
+    const implementationReady = appendMessage(cluster, 'IMPLEMENTATION_READY', 'worker', {});
+    const message = prBodyReadyMessage({
+      templateSha256: TEMPLATE_SHA256,
+      implementationCycleId: implementationReady.id,
+    });
+
+    await orchestratorInstance._injectPusherAfterPrBodyReady(cluster, message, {});
+    await orchestratorInstance._injectPusherAfterPrBodyReady(cluster, message, {});
+    await orchestratorInstance._injectPusherAfterPrBodyReady(cluster, message, {});
+
+    assert.strictEqual(
+      capturedAddAgentsOps.length,
+      1,
+      'only the first delivery should add an agent'
+    );
+    assert.strictEqual(cluster.agents.filter((a) => a.id === 'git-pusher').length, 1);
+  });
+
+  it('resume-safe: a cluster reloaded with git-pusher already present never re-injects', async function () {
+    const cluster = makeCluster('prbody-c7');
+    const implementationReady = appendMessage(cluster, 'IMPLEMENTATION_READY', 'worker', {});
+    // Simulate resume: git-pusher already exists in cluster.agents from a prior process.
+    cluster.agents.push({ id: 'git-pusher', config: { id: 'git-pusher' } });
+    const message = prBodyReadyMessage({
+      templateSha256: TEMPLATE_SHA256,
+      implementationCycleId: implementationReady.id,
+    });
+
+    await orchestratorInstance._injectPusherAfterPrBodyReady(cluster, message, {});
+
+    assert.strictEqual(capturedAddAgentsOps.length, 0);
   });
 });

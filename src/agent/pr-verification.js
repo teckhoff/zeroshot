@@ -4,6 +4,7 @@
 
 const { spawnSync } = require('child_process');
 const { getDefaultProviderId } = require('../../lib/provider-names');
+const { canonicalizeBody, hashBody } = require('../pr-body-validator');
 
 const DEFAULT_VERIFICATION_PLATFORM = 'github';
 
@@ -26,6 +27,11 @@ function parseJson(raw, commandName) {
   }
 }
 
+function stripRefsHeadsPrefix(ref) {
+  if (typeof ref !== 'string') return null;
+  return ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref;
+}
+
 const VERIFICATION_ADAPTERS = {
   github: {
     platform: 'github',
@@ -46,7 +52,7 @@ const VERIFICATION_ADAPTERS = {
           'view',
           ...(prNumber ? [String(prNumber)] : []),
           '--json',
-          'state,mergedAt,url,number,autoMergeRequest,mergeStateStatus',
+          'state,mergedAt,url,number,autoMergeRequest,mergeStateStatus,body,baseRefName',
         ],
       };
     },
@@ -59,6 +65,8 @@ const VERIFICATION_ADAPTERS = {
         url: data.url || null,
         autoMergeRequest: data.autoMergeRequest || null,
         mergeStateStatus: data.mergeStateStatus || null,
+        body: typeof data.body === 'string' ? data.body : null,
+        baseBranch: typeof data.baseRefName === 'string' ? data.baseRefName : null,
       };
     },
     isNotFoundError(err) {
@@ -104,6 +112,8 @@ const VERIFICATION_ADAPTERS = {
         state,
         mergedAt,
         url: data.web_url || data.url || null,
+        body: typeof data.description === 'string' ? data.description : null,
+        baseBranch: typeof data.target_branch === 'string' ? data.target_branch : null,
       };
     },
     isNotFoundError(err) {
@@ -157,6 +167,8 @@ const VERIFICATION_ADAPTERS = {
         state,
         mergedAt,
         url: data.pullRequestUrl || data.url || null,
+        body: typeof data.description === 'string' ? data.description : null,
+        baseBranch: stripRefsHeadsPrefix(data.targetRefName),
       };
     },
     isNotFoundError(err) {
@@ -293,6 +305,8 @@ function normalizeFetchedPrData(prData, adapter) {
     url: prData?.url || null,
     autoMergeRequest: prData?.autoMergeRequest || null,
     mergeStateStatus: prData?.mergeStateStatus || null,
+    body: typeof prData?.body === 'string' ? prData.body : null,
+    baseBranch: typeof prData?.baseBranch === 'string' ? prData.baseBranch : null,
   };
 }
 
@@ -685,6 +699,146 @@ async function verifyPullRequest({ result, agent, autoMerge }) {
   );
 }
 
+/**
+ * PR-body-template-file published-metadata verification.
+ *
+ * Runs after the transport-only git-pusher creates the PR/MR carrying an
+ * approved canonical body (template-file mode). Confirms the platform
+ * actually stored that exact body, and the configured base branch when one
+ * was specified, before any merge/auto-complete may begin. A mismatch
+ * leaves the PR open and never initiates a merge.
+ */
+
+function requireExpectedBodySha256(config) {
+  if (typeof config.expectedBodySha256 !== 'string' || config.expectedBodySha256 === '') {
+    throw new Error(
+      'verifyPrMetadata requires config.expectedBodySha256 (the PR_BODY_READY canonicalBodySha256).'
+    );
+  }
+  return config.expectedBodySha256;
+}
+
+function compareMetadata({ prData, expectedBodySha256, expectedBase }) {
+  const observedBodySha256 = hashBody(
+    canonicalizeBody(typeof prData.body === 'string' ? prData.body : '')
+  );
+  const bodyMismatch = observedBodySha256 !== expectedBodySha256;
+  const baseMismatch = expectedBase !== null && prData.baseBranch !== expectedBase;
+  return { observedBodySha256, bodyMismatch, baseMismatch };
+}
+
+function publishMetadataMismatch({
+  agent,
+  platform,
+  prData,
+  comparison,
+  expectedBodySha256,
+  expectedBase,
+}) {
+  const { observedBodySha256, bodyMismatch, baseMismatch } = comparison;
+  const mismatchData = {
+    ...buildVerificationPayload({ platform, prData, reason: 'pr-metadata-mismatch' }),
+    expected_body_sha256: expectedBodySha256,
+    observed_body_sha256: observedBodySha256,
+    body_mismatch: bodyMismatch,
+    expected_base: expectedBase,
+    observed_base: prData.baseBranch,
+    base_mismatch: baseMismatch,
+  };
+  const reasons = [];
+  if (bodyMismatch) reasons.push('body digest differs');
+  if (baseMismatch) reasons.push('base branch differs');
+  agent._log(
+    `🔴 PR metadata mismatch for published PR #${prData.number}: ${reasons.join('; ')}. No merge attempted.`
+  );
+  agent._publish({ topic: 'PR_METADATA_MISMATCH', content: { data: mismatchData } });
+  throw new Error(
+    `PR_METADATA_MISMATCH: published PR #${prData.number} does not match the approved candidate ` +
+      `(${reasons.join('; ')}). No merge was attempted.`
+  );
+}
+
+function completeReviewModeWithApprovedBody({ agent, platform, adapter, prData }) {
+  agent._log(
+    `✅ VERIFICATION PASSED: ${adapter.itemName} #${prData.number} created with the approved body ` +
+      '(open for human review)'
+  );
+  publishClusterComplete(agent, {
+    ...buildVerificationPayload({ platform, prData, reason: 'git-pusher-complete-verified' }),
+    merged: adapter.isMerged(prData),
+  });
+}
+
+function handOffToMerge({ agent, adapter, prData }) {
+  agent._log(
+    `✅ PR metadata verified for ${adapter.itemName} #${prData.number}; handing off to merge.`
+  );
+  agent._publish({
+    topic: 'PR_METADATA_VERIFIED',
+    content: { data: { pr_number: prData.number, pr_url: prData.url } },
+  });
+}
+
+/**
+ * @param {{result:object, agent:object, config:{expectedBodySha256:string, expectedBase?:(string|null), autoMerge?:boolean, shipHandoff?:boolean}}} params
+ */
+async function verifyPrMetadata({ result, agent, config }) {
+  const effectiveConfig = config && typeof config === 'object' ? config : {};
+  const expectedBodySha256 = requireExpectedBodySha256(effectiveConfig);
+  const expectedBase = effectiveConfig.expectedBase ? effectiveConfig.expectedBase : null;
+
+  const platform = resolveVerificationPlatform(agent);
+  const adapter = getVerificationAdapter(platform);
+  const providerName =
+    typeof agent?._resolveProvider === 'function'
+      ? agent._resolveProvider()
+      : getDefaultProviderId();
+
+  const claims = resolvePrClaimsFromOutput({
+    output: result.output,
+    parsedResult: result.parsedResult,
+    providerName,
+    adapter,
+  });
+  validatePrClaims(claims);
+
+  const prData = await fetchPrDataWithRetry({
+    adapter,
+    cwd: agent.workingDirectory,
+    prNumber: claims.claimedPrNumber,
+    agent,
+  });
+  validatePrUrl({ adapter, claimedPrUrl: claims.claimedPrUrl, prData });
+
+  const comparison = compareMetadata({ prData, expectedBodySha256, expectedBase });
+  if (comparison.bodyMismatch || comparison.baseMismatch) {
+    publishMetadataMismatch({
+      agent,
+      platform,
+      prData,
+      comparison,
+      expectedBodySha256,
+      expectedBase,
+    });
+    return;
+  }
+
+  if (effectiveConfig.autoMerge === false) {
+    completeReviewModeWithApprovedBody({ agent, platform, adapter, prData });
+    return;
+  }
+
+  if (effectiveConfig.shipHandoff === true) {
+    handOffToMerge({ agent, adapter, prData });
+    return;
+  }
+
+  publishClusterComplete(
+    agent,
+    buildVerificationPayload({ platform, prData, reason: 'git-pusher-complete-verified' })
+  );
+}
+
 module.exports = {
   parsePositiveInt,
   normalizePrNumber,
@@ -693,4 +847,10 @@ module.exports = {
   resolvePrClaimsFromOutput,
   publishClusterComplete,
   verifyPullRequest,
+  validatePrUrl,
+  validatePrClaims,
+  resolveVerificationPlatform,
+  getVerificationAdapter,
+  buildVerificationPayload,
+  verifyPrMetadata,
 };

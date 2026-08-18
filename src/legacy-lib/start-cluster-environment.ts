@@ -11,12 +11,19 @@ interface RunOptions extends Record<string, unknown> {
   noIsolation?: unknown;
   prBase?: unknown;
   prBody?: unknown;
+  prBodyTemplate?: unknown;
 }
 
 interface MountSpec {
   host: string;
   container: string;
   readonly: boolean;
+}
+
+interface PrBodyTemplateSnapshot {
+  sourcePath: string;
+  content: string;
+  sha256: string;
 }
 
 function firstTruthy<T>(...values: T[]): T | undefined {
@@ -151,6 +158,33 @@ function resolveMounts(options: RunOptions): MountSpec[] | undefined {
   return options.mount ? parseMountSpecs(options.mount) : undefined;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isPrBodyTemplateSnapshot(value: unknown): value is PrBodyTemplateSnapshot {
+  return (
+    isRecord(value) &&
+    typeof value.sourcePath === 'string' &&
+    typeof value.content === 'string' &&
+    typeof value.sha256 === 'string'
+  );
+}
+
+// Never touches the filesystem: daemon and resume consume the immutable
+// snapshot admitted at CLI time (directly, or forwarded through
+// ZEROSHOT_RUN_OPTIONS) and never reread the source template.
+function resolvePrBodyTemplate(options: RunOptions): PrBodyTemplateSnapshot | undefined {
+  if (isPrBodyTemplateSnapshot(options.prBodyTemplate)) {
+    return options.prBodyTemplate;
+  }
+  const envOptions = parseRunOptionsEnv();
+  if (envOptions && isPrBodyTemplateSnapshot(envOptions.prBodyTemplate)) {
+    return envOptions.prBodyTemplate;
+  }
+  return undefined;
+}
+
 export = {
   firstTruthy,
   anyTruthy,
@@ -163,4 +197,5 @@ export = {
   resolvePrBase,
   resolveCloseIssue,
   resolveMounts,
+  resolvePrBodyTemplate,
 };

@@ -29,6 +29,9 @@ interface RunOptions extends Record<string, unknown> {
   pr?: unknown;
   prBase?: unknown;
   prBody?: unknown;
+  prBodyMode?: unknown;
+  prBodyTemplate?: unknown;
+  prBodyTemplateFile?: unknown;
   preparedWorktree?: unknown;
   requiredQualityGates?: unknown;
   ship?: unknown;
@@ -57,6 +60,9 @@ interface EnvironmentFacade {
   resolveMounts(options: RunOptions):
     | Array<{ host: string; container: string; readonly: boolean }>
     | undefined;
+  resolvePrBodyTemplate(
+    options: RunOptions
+  ): { sourcePath: string; content: string; sha256: string } | undefined;
 }
 
 interface BuildStartOptionsArgs {
@@ -101,6 +107,7 @@ const {
   resolvePrBase,
   resolveCloseIssue,
   resolveMounts,
+  resolvePrBodyTemplate,
 } = environmentHelpers;
 
 function isRunIsolation(value: string): value is RunIsolation {
@@ -203,6 +210,10 @@ function buildStartOptionsFromPlan({
     forceProvider: optionalValue(forceProvider),
     prBase: environment ? resolvePrBase(options) : optionalValue(options.prBase),
     prBody: typeof options.prBody === 'string' ? options.prBody : undefined,
+    prBodyMode: options.prBodyMode === 'template-file' ? 'template-file' : undefined,
+    prBodyTemplate: environment
+      ? resolvePrBodyTemplate(options)
+      : (options.prBodyTemplate ?? undefined),
     mergeQueue: environment ? resolveMergeQueue(options) : optionalValue(options.mergeQueue),
     closeIssue: environment ? resolveCloseIssue(options) : optionalValue(options.closeIssue),
     ship: plan.delivery === 'ship',

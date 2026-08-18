@@ -160,6 +160,24 @@ template supports `{{issue_number}}`, `{{issue_title}}`, and `{{issue_reference}
 expand to empty text for tasks without an issue, so manual runs never emit `Closes #unknown`.
 The unrendered template is retained for detached and resumed runs.
 
+`--pr-body-template-file <path>` is the generative counterpart: it snapshots a repository-owned
+Markdown template (for example `tests/fixtures/pr-body-templates/unrealhog.md`) once at admission
+and hands it to a dedicated read-only agent that completes every section from the validated
+implementation and its test evidence, preserving the template's exact heading structure. It
+requires `--pr` or `--ship` and cannot be combined with `--pr-body`.
+
+```bash
+zeroshot run 123 --pr --pr-body-template-file tests/fixtures/pr-body-templates/unrealhog.md
+zeroshot run 123 --ship --pr-body-template-file tests/fixtures/pr-body-templates/unrealhog.md -d
+```
+
+The snapshot taken at admission is immutable and is never reread, even if the source file changes
+or is deleted before the run finishes. A deterministic validator - not a model - checks the
+completed body against the snapshot and the run's quality-gate evidence; an invalid candidate gets
+one correction attempt, and a second invalid candidate fails the run closed before any commit,
+push, or pull request is created. Check `zeroshot status <id>` or `zeroshot logs <id>` for
+`PR_BODY_AUTHORING_FAILED` diagnostics (violated rules and affected sections) when that happens.
+
 The `trace` export is a deterministic, provider-neutral research bundle. It preserves the ordered
 cluster ledger, exact selected prompts, and exact raw task-log bytes without interpreting a Claude,
 Codex, Pi, or other provider protocol. Missing evidence is recorded explicitly in its footer. File
@@ -233,7 +251,7 @@ Each layer ships the same way: extracted from the platform we run, then opened. 
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) before participating, and [SECURITY.md](SECURITY.md) for security reports. More in [`docs/`](docs/) and [CLAUDE.md](./CLAUDE.md).
 
-<!-- discord-placeholder -->
+<!-- discord-invite-marker -->
 
 Questions and help: [Discord](https://discord.gg/fZyzf2Cut9).
 

@@ -227,6 +227,32 @@ describe('git-pusher --pr vs --ship (autoMerge)', function () {
     assert.strictEqual(prOptions.prBody, prBody);
   });
 
+  it('buildPrOptions defaults prBodyMode to "literal" and prBodyTemplate to null when template-file mode is not requested', function () {
+    const prOptions = Orchestrator.buildPrOptions({ pr: true, prBody: 'x' }, []);
+
+    assert.strictEqual(prOptions.prBodyMode, 'literal');
+    assert.strictEqual(prOptions.prBodyTemplate, null);
+    assert.strictEqual(typeof prOptions.zeroshotVersion, 'string');
+  });
+
+  it('buildPrOptions persists prBodyMode="template-file" and the full immutable snapshot for resume', function () {
+    const snapshot = {
+      sourcePath: '.github/pull_request_template.md',
+      content: '## Problem\n\n{{issue_reference}}\n',
+      sha256: 'a'.repeat(64),
+    };
+    const prOptions = Orchestrator.buildPrOptions(
+      { pr: true, prBodyMode: 'template-file', prBodyTemplate: snapshot },
+      []
+    );
+
+    assert.strictEqual(prOptions.prBodyMode, 'template-file');
+    assert.deepStrictEqual(prOptions.prBodyTemplate, snapshot);
+    // Never overloaded into prBody - the immutable snapshot and the literal
+    // body field must stay independent.
+    assert.strictEqual(prOptions.prBody, null);
+  });
+
   it('resolveRunPlan is the single source for the autoMerge decision', function () {
     assert.strictEqual(Orchestrator.resolveRunPlan({ ship: true }).autoMerge, true);
     assert.strictEqual(Orchestrator.resolveRunPlan({ pr: true }).autoMerge, false);

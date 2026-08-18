@@ -39,7 +39,7 @@ function selectOwnProperty(
   options: PropertySelectionOptions = {}
 ): unknown {
   for (const candidate of candidates) {
-    if (!Object.prototype.hasOwnProperty.call(candidate || {}, key)) {
+    if (!Object.prototype.hasOwnProperty.call(candidate ? candidate : {}, key)) {
       continue;
     }
 
@@ -53,7 +53,8 @@ function selectOwnProperty(
 }
 
 function readRepoSettingsValue(startDir: string): unknown {
-  return readRepoSettings(startDir).settings || {};
+  const settings = readRepoSettings(startDir).settings;
+  return settings ? settings : {};
 }
 
 export = {

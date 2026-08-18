@@ -30,6 +30,16 @@ const HOOK_ACTION_TOPIC_CONTRACTS = Object.freeze({
     { topic: 'CLUSTER_COMPLETE', keys: null },
     { topic: 'PUSH_BLOCKED', keys: null },
   ]),
+  validate_pr_body: Object.freeze([
+    { topic: 'PR_BODY_READY', keys: null },
+    { topic: 'PR_BODY_REVISION_REQUESTED', keys: null },
+    { topic: 'PR_BODY_AUTHORING_FAILED', keys: null },
+  ]),
+  verify_pr_metadata: Object.freeze([
+    { topic: 'CLUSTER_COMPLETE', keys: null },
+    { topic: 'PR_METADATA_VERIFIED', keys: null },
+    { topic: 'PR_METADATA_MISMATCH', keys: null },
+  ]),
 });
 
 /**

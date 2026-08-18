@@ -10,7 +10,8 @@
 
 const vm = require('vm');
 const { execSync } = require('../lib/safe-exec'); // Enforces timeouts
-const { verifyPullRequest } = require('./pr-verification');
+const { verifyPullRequest, verifyPrMetadata } = require('./pr-verification');
+const { validatePrBodyHook } = require('./pr-body-authoring');
 
 /**
  * Deep merge two objects, with source taking precedence
@@ -147,6 +148,16 @@ async function executeHook(params) {
 
   if (hook.action === 'verify_pull_request') {
     await verifyPullRequest({ result, agent, autoMerge: hook.config?.autoMerge });
+    return;
+  }
+
+  if (hook.action === 'validate_pr_body') {
+    await validatePrBodyHook({ result, agent });
+    return;
+  }
+
+  if (hook.action === 'verify_pr_metadata') {
+    await verifyPrMetadata({ result, agent, config: hook.config });
     return;
   }
 

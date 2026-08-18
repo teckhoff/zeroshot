@@ -40,6 +40,29 @@ function normalizePrBodyTemplate(value) {
 }
 
 /**
+ * Substitute the three supported issue tokens into arbitrary Markdown
+ * content. Unlike renderPullRequestBody, this never falls back to the
+ * issue reference for a missing/null template -- callers own that content.
+ */
+function renderIssueTokens(content, options = {}) {
+  if (typeof content !== 'string') {
+    throw new TypeError('PR body content must be a string');
+  }
+  const issueContext = resolveIssueContext(options);
+  const hasIssue = issueContext.issueNumber !== 'unknown';
+  const substitutions = {
+    '{{issue_number}}': hasIssue ? issueContext.issueNumber : '',
+    '{{issue_title}}': hasIssue ? issueContext.issueTitle : '',
+    '{{issue_reference}}': hasIssue ? issueContext.issueReference : '',
+  };
+  let rendered = content;
+  for (const [token, replacement] of Object.entries(substitutions)) {
+    rendered = rendered.replaceAll(token, replacement);
+  }
+  return rendered;
+}
+
+/**
  * Render a bounded PR body. Missing issue metadata expands to empty text so
  * manual tasks never leak internal sentinel values into pull requests.
  */
@@ -48,16 +71,7 @@ function renderPullRequestBody(template, options = {}) {
   const normalizedTemplate = normalizePrBodyTemplate(template);
   if (normalizedTemplate === null) return issueContext.issueReference;
 
-  const hasIssue = issueContext.issueNumber !== 'unknown';
-  const substitutions = {
-    '{{issue_number}}': hasIssue ? issueContext.issueNumber : '',
-    '{{issue_title}}': hasIssue ? issueContext.issueTitle : '',
-    '{{issue_reference}}': hasIssue ? issueContext.issueReference : '',
-  };
-  let rendered = normalizedTemplate;
-  for (const [token, replacement] of Object.entries(substitutions)) {
-    rendered = rendered.replaceAll(token, replacement);
-  }
+  const rendered = renderIssueTokens(normalizedTemplate, options);
   if (rendered.length > MAX_PR_BODY_LENGTH) {
     throw new TypeError(`Rendered PR body must not exceed ${MAX_PR_BODY_LENGTH} characters`);
   }
@@ -67,5 +81,6 @@ function renderPullRequestBody(template, options = {}) {
 module.exports = {
   MAX_PR_BODY_LENGTH,
   renderPullRequestBody,
+  renderIssueTokens,
   resolveIssueContext,
 };

@@ -7,6 +7,7 @@
 
 const assert = require('assert');
 const childProcess = require('child_process');
+const { hashBody, canonicalizeBody } = require('../src/pr-body-validator');
 
 function spawnSuccess(stdout) {
   return { status: 0, stdout, stderr: '' };
@@ -492,7 +493,7 @@ describe('verify_pull_request hook action', () => {
     await executeHook({ hook, agent, result });
     assert.strictEqual(
       capturedCmd,
-      'gh pr view 100 --json state,mergedAt,url,number,autoMergeRequest,mergeStateStatus'
+      'gh pr view 100 --json state,mergedAt,url,number,autoMergeRequest,mergeStateStatus,body,baseRefName'
     );
   });
 
@@ -746,6 +747,136 @@ describe('verify_pull_request hook action', () => {
       mockSpawnSyncFn = () => spawnFailure('Could not resolve to a PullRequest');
 
       await assert.rejects(() => executeHook({ hook, agent, result }), /DOES NOT EXIST/);
+    });
+  });
+
+  describe('verify_pr_metadata action (pr-body-template-file mode)', () => {
+    const APPROVED_BODY = '## Problem\n\nClosed #1\n';
+    const APPROVED_BODY_SHA256 = hashBody(canonicalizeBody(APPROVED_BODY));
+    const claimResult = {
+      output: JSON.stringify({
+        pr_url: 'https://github.com/org/repo/pull/42',
+        pr_number: 42,
+        merged: false,
+      }),
+    };
+
+    function githubView({ body = APPROVED_BODY, baseRefName = 'main' } = {}) {
+      return spawnSuccess(
+        JSON.stringify({
+          number: 42,
+          state: 'OPEN',
+          mergedAt: null,
+          url: 'https://github.com/org/repo/pull/42',
+          body,
+          baseRefName,
+        })
+      );
+    }
+
+    it('requires config.expectedBodySha256', async function () {
+      const agent = createMockAgent();
+      const hook = { action: 'verify_pr_metadata', config: {} };
+      await assert.rejects(
+        () => executeHook({ hook, agent, result: claimResult }),
+        /expectedBodySha256/
+      );
+    });
+
+    it('review mode (autoMerge=false): matching body/base publishes CLUSTER_COMPLETE via one view command only', async function () {
+      const agent = createMockAgent();
+      let commandsRun = 0;
+      mockSpawnSyncFn = () => {
+        commandsRun += 1;
+        return githubView();
+      };
+      const hook = {
+        action: 'verify_pr_metadata',
+        config: {
+          expectedBodySha256: APPROVED_BODY_SHA256,
+          expectedBase: 'main',
+          autoMerge: false,
+        },
+      };
+
+      await executeHook({ hook, agent, result: claimResult });
+
+      assert.strictEqual(commandsRun, 1, 'only the view command should run - no merge command');
+      assert.strictEqual(agent.lastPublished.topic, 'CLUSTER_COMPLETE');
+    });
+
+    it('ship handoff (shipHandoff=true): matching body/base publishes PR_METADATA_VERIFIED, not CLUSTER_COMPLETE', async function () {
+      const agent = createMockAgent();
+      mockSpawnSyncFn = () => githubView();
+      const hook = {
+        action: 'verify_pr_metadata',
+        config: {
+          expectedBodySha256: APPROVED_BODY_SHA256,
+          expectedBase: 'main',
+          autoMerge: true,
+          shipHandoff: true,
+        },
+      };
+
+      await executeHook({ hook, agent, result: claimResult });
+
+      assert.strictEqual(agent.lastPublished.topic, 'PR_METADATA_VERIFIED');
+      assert.deepStrictEqual(agent.lastPublished.content.data, {
+        pr_number: 42,
+        pr_url: 'https://github.com/org/repo/pull/42',
+      });
+    });
+
+    it('mismatched body: publishes PR_METADATA_MISMATCH, throws, never runs a second (merge) command, never leaks the body', async function () {
+      const agent = createMockAgent();
+      let commandsRun = 0;
+      mockSpawnSyncFn = () => {
+        commandsRun += 1;
+        return githubView({ body: 'a completely different body' });
+      };
+      const hook = {
+        action: 'verify_pr_metadata',
+        config: {
+          expectedBodySha256: APPROVED_BODY_SHA256,
+          expectedBase: 'main',
+          autoMerge: true,
+          shipHandoff: true,
+        },
+      };
+
+      await assert.rejects(
+        () => executeHook({ hook, agent, result: claimResult }),
+        /PR_METADATA_MISMATCH/
+      );
+
+      assert.strictEqual(commandsRun, 1, 'no merge command should ever run after a mismatch');
+      assert.strictEqual(agent.lastPublished.topic, 'PR_METADATA_MISMATCH');
+      const data = agent.lastPublished.content.data;
+      assert.strictEqual(data.body_mismatch, true);
+      assert.strictEqual(data.expected_body_sha256, APPROVED_BODY_SHA256);
+      assert.notStrictEqual(data.observed_body_sha256, APPROVED_BODY_SHA256);
+      assert.strictEqual(JSON.stringify(data).includes('completely different body'), false);
+    });
+
+    it('mismatched base branch: publishes PR_METADATA_MISMATCH and throws, leaving the PR open', async function () {
+      const agent = createMockAgent();
+      mockSpawnSyncFn = () => githubView({ baseRefName: 'dev' });
+      const hook = {
+        action: 'verify_pr_metadata',
+        config: {
+          expectedBodySha256: APPROVED_BODY_SHA256,
+          expectedBase: 'main',
+          autoMerge: false,
+        },
+      };
+
+      await assert.rejects(
+        () => executeHook({ hook, agent, result: claimResult }),
+        /PR_METADATA_MISMATCH/
+      );
+
+      assert.strictEqual(agent.lastPublished.topic, 'PR_METADATA_MISMATCH');
+      assert.strictEqual(agent.lastPublished.content.data.base_mismatch, true);
     });
   });
 });

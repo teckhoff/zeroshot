@@ -13,6 +13,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const lockfile = require('proper-lockfile');
+const { version: ZEROSHOT_VERSION } = require('../package.json');
 
 // Stale lock timeout in ms - if lock file is older than this, delete it
 const LOCK_STALE_MS = 5000;
@@ -151,6 +152,10 @@ const WORKFLOW_TRIGGERS = Object.freeze([
   'VALIDATION_RESULT',
   'PUSH_BLOCKED',
   'CONDUCTOR_ESCALATE',
+  'PR_BODY_READY',
+  'PR_BODY_REVISION_REQUESTED',
+  'PR_BODY_AUTHORING_FAILED',
+  'PR_METADATA_VERIFIED',
 ]);
 
 const PUSH_BLOCKED_REPAIR_TRIGGER = Object.freeze({
@@ -252,11 +257,24 @@ function applyPushBlockedRepairTriggers(config) {
   }
 }
 
+// Absent mode means legacy literal/default resolution - only these four values are ever valid.
+const KNOWN_PR_BODY_MODES = new Set([undefined, null, 'literal', 'template-file']);
+
+function assertKnownPrBodyMode(mode) {
+  if (!KNOWN_PR_BODY_MODES.has(mode)) {
+    throw new Error(
+      `Unknown prBodyMode "${mode}" - this cluster requires a newer Zeroshot version that supports it.`
+    );
+  }
+}
+
 function buildPrOptions(options, requiredQualityGates) {
   // autoMerge must always be persisted (even when no other PR fields are set) so that
   // `zeroshot run --pr` (autoMerge=false) vs `--ship` (autoMerge=true) survives resume.
   // Derived from the canonical run plan — never recomputed from ship/pr here.
   const autoMerge = resolveRunPlan(options).autoMerge;
+  const prBodyMode = options.prBodyMode === 'template-file' ? 'template-file' : 'literal';
+  assertKnownPrBodyMode(prBodyMode);
 
   return {
     prBase: options.prBase || null,
@@ -265,6 +283,9 @@ function buildPrOptions(options, requiredQualityGates) {
     prBody: typeof options.prBody === 'string' ? options.prBody : null,
     gitRemote: options.gitRemote || null,
     autoMerge,
+    prBodyMode,
+    prBodyTemplate: options.prBodyTemplate ? options.prBodyTemplate : null,
+    zeroshotVersion: ZEROSHOT_VERSION,
     ...(requiredQualityGates.length > 0 ? { requiredQualityGates } : {}),
     cwd: options.cwd || process.cwd(),
   };
@@ -615,6 +636,8 @@ class Orchestrator {
       throw error;
     }
 
+    assertKnownPrBodyMode(clusterData.prOptions ? clusterData.prOptions.prBodyMode : undefined);
+
     const cluster = {
       ...clusterContext,
       ledger,
@@ -935,7 +958,10 @@ class Orchestrator {
           // Persist normalized run mode for status/list display
           runMode: cluster.runMode || null,
           // Persist PR options for resume
-          prOptions: cluster.prOptions || null,
+          prOptions: (() => {
+            assertKnownPrBodyMode(cluster.prOptions ? cluster.prOptions.prBodyMode : undefined);
+            return cluster.prOptions ? cluster.prOptions : null;
+          })(),
           // Persist cluster-scoped command proof configuration for resume and dynamic agents
           commandProofs: cluster.commandProofs || [],
           // Persist model override for consistent agent spawning on resume
@@ -1684,6 +1710,124 @@ class Orchestrator {
     });
   }
 
+  /**
+   * @private
+   * Template-file mode: once the pr-body-author's candidate passes
+   * deterministic validation (PR_BODY_READY), idempotently inject the
+   * transport-only git-pusher carrying the approved canonical body. Runs
+   * for every PR_BODY_READY delivery (duplicate messages, repeated trigger
+   * evaluation, resume) but only ever adds the pusher once per cycle.
+   */
+  _registerPrBodyReadyHandler(messageBus, clusterId, isolationManager, containerId) {
+    this._subscribeToClusterTopic(messageBus, clusterId, 'PR_BODY_READY', async (message) => {
+      const cluster = this.clusters.get(clusterId);
+      if (!cluster) return;
+      try {
+        await this._injectPusherAfterPrBodyReady(cluster, message, {
+          isolationManager,
+          containerId,
+        });
+      } catch (err) {
+        console.error(
+          `Failed to inject git-pusher after PR_BODY_READY for ${clusterId}:`,
+          err.message
+        );
+      }
+    });
+  }
+
+  /**
+   * @private
+   * Resolve the git platform for a template-file-mode PR-body delivery,
+   * mirroring _injectCompletionAgent's stored-metadata-then-git-context
+   * fallback.
+   */
+  _resolvePrBodyReadyPlatform(cluster) {
+    if (cluster.gitPlatform) {
+      return cluster.gitPlatform;
+    }
+    const { getPlatformForPR } = require('./issue-providers');
+    return getPlatformForPR(cluster.cwd || process.cwd());
+  }
+
+  /**
+   * @private
+   * See _registerPrBodyReadyHandler. Idempotent: ignores stale cycles/templates
+   * and never adds a second git-pusher.
+   */
+  async _injectPusherAfterPrBodyReady(cluster, message, context) {
+    if (cluster.prOptions?.prBodyMode !== 'template-file') {
+      return;
+    }
+
+    const data = message.content?.data || {};
+    const prBodyTemplate = cluster.prOptions.prBodyTemplate;
+    if (!prBodyTemplate || data.templateSha256 !== prBodyTemplate.sha256) {
+      return;
+    }
+
+    const { resolveImplementationCycleId } = require('./pr-body-evidence');
+    if (data.implementationCycleId !== resolveImplementationCycleId(cluster)) {
+      return;
+    }
+
+    if (this._clusterHasAgent(cluster, 'git-pusher')) {
+      return;
+    }
+
+    const {
+      generateGitPusherAgent,
+      generatePrMergerAgent,
+      isPlatformSupported,
+    } = require('./agents/git-pusher-template');
+    const platform = this._resolvePrBodyReadyPlatform(cluster);
+    if (!isPlatformSupported(platform)) {
+      throw new Error(
+        `Platform '${platform}' does not support --pr mode. Supported: github, gitlab, azure-devops`
+      );
+    }
+
+    const issueMsg = cluster.messageBus.ledger.findLast({
+      cluster_id: cluster.id,
+      topic: 'ISSUE_OPENED',
+    });
+    const issueNumber = issueMsg?.content?.data?.issue_number || 'unknown';
+    const issueTitle = issueMsg?.content?.data?.title || 'Implementation';
+
+    // Always review-mode create-only: the git-pusher only creates the PR with
+    // the approved body. verify_pr_metadata (not verify_pull_request) gates
+    // any subsequent merge on the platform actually storing that exact body.
+    const gitPusherConfig = generateGitPusherAgent(platform, {
+      ...cluster.prOptions,
+      prBody: data.canonicalBody,
+      autoMerge: false,
+      issueNumber,
+      issueTitle,
+    });
+    gitPusherConfig.hooks = {
+      onComplete: {
+        action: 'verify_pr_metadata',
+        config: {
+          autoMerge: false,
+          shipHandoff: cluster.prOptions.autoMerge === true,
+          expectedBodySha256: data.canonicalBodySha256,
+          expectedBase: cluster.prOptions.prBase ? cluster.prOptions.prBase : null,
+        },
+      },
+    };
+
+    const agentsToAdd = [gitPusherConfig];
+    if (cluster.prOptions.autoMerge === true) {
+      agentsToAdd.push(generatePrMergerAgent(platform, cluster.prOptions));
+    }
+
+    await this._opAddAgents(cluster, { agents: agentsToAdd }, context);
+    this._log(
+      `[Orchestrator] Injected ${platform}-git-pusher agent from approved PR_BODY_READY (template-file mode)`
+    );
+    await this._saveClusters();
+  }
+
   _registerAgentLifecycleHandlers(messageBus, _clusterId) {
     messageBus.on('topic:AGENT_LIFECYCLE', async (message) => {
       const event = message.content?.data?.event;
@@ -1885,6 +2029,7 @@ class Orchestrator {
     this._registerAgentErrorHandler(messageBus, clusterId);
     this._registerPushBlockedHandler(messageBus, clusterId);
     this._registerAgentLifecycleHandlers(messageBus, clusterId);
+    this._registerPrBodyReadyHandler(messageBus, clusterId, isolationManager, containerId);
 
     const watchdog = this._registerConductorWatchdog(messageBus, clusterId);
     this._registerClusterOperationsHandler(
@@ -1987,12 +2132,75 @@ class Orchestrator {
     return { isolationManager, containerId, worktreeInfo, image: isolationImage };
   }
 
+  /**
+   * @private
+   * Resolve the execution isolation mode label used only for diagnostic
+   * text in the pr-body-author prompt (never affects validation).
+   */
+  _resolveIsolationModeLabel(options) {
+    if (options.isolation) return 'docker';
+    if (options.worktree) return 'worktree';
+    return 'none';
+  }
+
+  /**
+   * @private
+   * Template-file mode injects a read-only pr-body-author agent instead of
+   * the git-pusher. The transport-only git-pusher is injected later, once
+   * PR_BODY_READY carries an approved canonical body (see
+   * _injectPusherAfterPrBodyReady).
+   */
+  _injectPrBodyAuthor(config, inputData, options) {
+    const { renderIssueTokens, resolveIssueContext } = require('./pr-body-template');
+    const { generatePrBodyAuthorAgent } = require('./agents/pr-body-author-template');
+
+    const prBodyTemplate = options.prBodyTemplate;
+    if (!prBodyTemplate) {
+      throw new Error(
+        '--pr-body-template-file requires a template snapshot (options.prBodyTemplate is missing).'
+      );
+    }
+
+    const issueTokenOptions = { issueNumber: inputData.number, issueTitle: inputData.title };
+    const issueContext = resolveIssueContext(issueTokenOptions);
+    const renderedTemplate = renderIssueTokens(prBodyTemplate.content, issueTokenOptions);
+    const taskText = inputData.context ? inputData.context : inputData.body ? inputData.body : '';
+
+    const authorConfig = generatePrBodyAuthorAgent({
+      template: prBodyTemplate,
+      renderedTemplate,
+      taskText,
+      issueContext,
+      // No implementation has run yet at cluster setup time, so there is no
+      // evidence to embed here. validatePrBodyHook rebuilds a fresh, current
+      // evidence catalog from the live cluster at task-completion time and
+      // validates the candidate against it - this placeholder never governs
+      // acceptance.
+      evidenceCatalog: { entries: [] },
+      repoInstructions: null,
+      executionContext: {
+        platform: process.platform,
+        isolationMode: this._resolveIsolationModeLabel(options),
+        testEnvironment: null,
+      },
+      providerIdentity: { agentId: 'pr-body-author', provider: null },
+    });
+
+    config.agents.push(authorConfig);
+    this._log('[Orchestrator] Injected pr-body-author agent (template-file mode)');
+  }
+
   _applyAutoPrConfig(config, inputData, options) {
     if (!options.autoPr) {
       return;
     }
 
     config.agents = config.agents.filter((a) => a.id !== 'completion-detector');
+
+    if (options.prBodyMode === 'template-file') {
+      this._injectPrBodyAuthor(config, inputData, options);
+      return;
+    }
 
     // Detect git platform (independent of issue provider)
     const { getPlatformForPR } = require('./issue-providers');
@@ -3840,6 +4048,7 @@ Continue from where you left off. Review your previous output to understand what
       (agent) =>
         agent.id === 'completion-detector' ||
         agent.id === 'git-pusher' ||
+        agent.id === 'pr-body-author' ||
         agent.hooks?.onComplete?.config?.topic === 'CLUSTER_COMPLETE' ||
         agent.triggers?.some((trigger) => trigger.action === 'stop_cluster')
     );
@@ -3861,8 +4070,11 @@ Continue from where you left off. Review your previous output to understand what
     const hasGitPusher =
       this._clusterHasAgent(cluster, 'git-pusher') ||
       agentConfigs.some((agent) => agent?.id === 'git-pusher');
+    const hasPrBodyAuthor =
+      this._clusterHasAgent(cluster, 'pr-body-author') ||
+      agentConfigs.some((agent) => agent?.id === 'pr-body-author');
 
-    if (!isPrMode || !hasGitPusher) {
+    if (!isPrMode || (!hasGitPusher && !hasPrBodyAuthor)) {
       return agentConfigs;
     }
 
@@ -4218,6 +4430,48 @@ Continue from where you left off. Review your previous output to understand what
   }
 
   /**
+   * @private
+   * Build the pr-body-author agent config for a live cluster (resume /
+   * dynamic-template-load path), reading the issue context from the ledger
+   * instead of the initial-setup inputData object.
+   */
+  _buildPrBodyAuthorConfigFromCluster(cluster) {
+    const { renderIssueTokens, resolveIssueContext } = require('./pr-body-template');
+    const { generatePrBodyAuthorAgent } = require('./agents/pr-body-author-template');
+
+    const prBodyTemplate = cluster.prOptions.prBodyTemplate;
+    const issueMsg = cluster.messageBus.ledger.findLast({
+      cluster_id: cluster.id,
+      topic: 'ISSUE_OPENED',
+    });
+    const issueTokenOptions = {
+      issueNumber: issueMsg?.content?.data?.issue_number,
+      issueTitle: issueMsg?.content?.data?.title,
+    };
+    const issueContext = resolveIssueContext(issueTokenOptions);
+    const renderedTemplate = renderIssueTokens(prBodyTemplate.content, issueTokenOptions);
+    const taskText = issueMsg?.content?.data?.body ? issueMsg.content.data.body : '';
+
+    return generatePrBodyAuthorAgent({
+      template: prBodyTemplate,
+      renderedTemplate,
+      taskText,
+      issueContext,
+      // No implementation has run yet at injection time; validatePrBodyHook
+      // rebuilds a fresh evidence catalog from the live cluster and governs
+      // acceptance, not this placeholder.
+      evidenceCatalog: { entries: [] },
+      repoInstructions: null,
+      executionContext: {
+        platform: process.platform,
+        isolationMode: 'unknown',
+        testEnvironment: null,
+      },
+      providerIdentity: { agentId: 'pr-body-author', provider: null },
+    });
+  }
+
+  /**
    * Inject appropriate completion agent based on mode
    * Templates define work, orchestrator controls termination strategy
    * @private
@@ -4225,13 +4479,23 @@ Continue from where you left off. Review your previous output to understand what
   async _injectCompletionAgent(cluster, context) {
     // Skip if completion agent already exists
     const hasCompletionAgent = cluster.agents.some(
-      (a) => a.config?.id === 'completion-detector' || a.config?.id === 'git-pusher'
+      (a) =>
+        a.config?.id === 'completion-detector' ||
+        a.config?.id === 'git-pusher' ||
+        a.config?.id === 'pr-body-author'
     );
     if (hasCompletionAgent) {
       return;
     }
 
     const isPrMode = cluster.autoPr ?? process.env.ZEROSHOT_PR === '1';
+
+    if (isPrMode && cluster.prOptions?.prBodyMode === 'template-file') {
+      const authorConfig = this._buildPrBodyAuthorConfigFromCluster(cluster);
+      await this._opAddAgents(cluster, { agents: [authorConfig] }, context);
+      this._log(`    [--pr mode] Injected pr-body-author agent (template-file mode)`);
+      return;
+    }
 
     if (isPrMode) {
       // Detect platform from stored cluster metadata OR git context
@@ -4259,7 +4523,10 @@ Continue from where you left off. Review your previous output to understand what
       }
 
       // Get issue context from ledger
-      const issueMsg = cluster.messageBus.ledger.findLast({ topic: 'ISSUE_OPENED' });
+      const issueMsg = cluster.messageBus.ledger.findLast({
+        cluster_id: cluster.id,
+        topic: 'ISSUE_OPENED',
+      });
       const issueNumber = issueMsg?.content?.data?.issue_number || 'unknown';
       const issueTitle = issueMsg?.content?.data?.title || 'Implementation';
 

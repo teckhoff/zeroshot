@@ -27,6 +27,8 @@ interface RunOptions extends Record<string, unknown> {
   pr?: unknown;
   prBase?: unknown;
   prBody?: unknown;
+  prBodyMode?: unknown;
+  prBodyTemplate?: unknown;
   ship?: unknown;
   worktree?: unknown;
 }
@@ -241,6 +243,8 @@ async function registerDetachedSetupCluster({
         ? {
             prBase: runOptions.prBase,
             prBody: typeof runOptions.prBody === 'string' ? runOptions.prBody : null,
+            prBodyMode: runOptions.prBodyMode === 'template-file' ? 'template-file' : 'literal',
+            prBodyTemplate: runOptions.prBodyTemplate ? runOptions.prBodyTemplate : null,
             mergeQueue: runOptions.mergeQueue || false,
             closeIssue: runOptions.closeIssue || null,
             autoMerge: plan.autoMerge,

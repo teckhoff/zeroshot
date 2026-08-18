@@ -351,6 +351,69 @@ function spawnDetachedChild(env, cwd, logFd) {
   return daemon;
 }
 
+// Admits --pr-body-template-file: snapshots the template once at foreground
+// admission time, or recovers the immutable snapshot forwarded through
+// ZEROSHOT_RUN_OPTIONS in daemon mode. Never reads the source file in daemon
+// mode. Mutates effectiveOptions in place (prBodyMode/prBodyTemplate) so the
+// same object flows into runClusterPreflight, buildStartOptions, and
+// serializeRunOptions unchanged.
+// Pure admission logic (throws PrBodyTemplateError-shaped errors; never
+// exits) so it can be exercised directly in tests. admitPrBodyOptions below
+// is the thin CLI-facing wrapper that prints and exits.
+function resolvePrBodyOptionsOrThrow(effectiveOptions, effectiveRunPlan) {
+  const pathInput = effectiveOptions.prBodyTemplateFile;
+  if (!pathInput) {
+    return;
+  }
+
+  const {
+    PR_BODY_TEMPLATE_ERRORS,
+    PrBodyTemplateError,
+    admitPrBodyTemplateFile,
+  } = require('../src/pr-body-template-file');
+
+  if (effectiveRunPlan.delivery === 'none') {
+    throw new PrBodyTemplateError(
+      PR_BODY_TEMPLATE_ERRORS.REQUIRES_DELIVERY,
+      '--pr-body-template-file requires --pr or --ship.',
+      'Add --pr or --ship to the command, or remove --pr-body-template-file.'
+    );
+  }
+  if (typeof effectiveOptions.prBody === 'string') {
+    throw new PrBodyTemplateError(
+      PR_BODY_TEMPLATE_ERRORS.OPTIONS_CONFLICT,
+      '--pr-body and --pr-body-template-file cannot both be set.',
+      'Choose one: --pr-body for a final literal body, or --pr-body-template-file for a generated one.'
+    );
+  }
+
+  let snapshot;
+  if (process.env.ZEROSHOT_DAEMON === '1') {
+    const { resolvePrBodyTemplate } = require('../lib/start-cluster-environment');
+    snapshot = resolvePrBodyTemplate(effectiveOptions);
+    if (!snapshot) {
+      throw new Error('Daemon mode is missing the forwarded --pr-body-template-file snapshot.');
+    }
+  } else {
+    snapshot = admitPrBodyTemplateFile({ pathInput, repoRoot: detectGitRepoRoot() });
+  }
+
+  effectiveOptions.prBodyMode = 'template-file';
+  effectiveOptions.prBodyTemplate = snapshot;
+}
+
+function admitPrBodyOptions(effectiveOptions, effectiveRunPlan) {
+  try {
+    resolvePrBodyOptionsOrThrow(effectiveOptions, effectiveRunPlan);
+  } catch (error) {
+    console.error(`${error.code || 'PR_BODY_TEMPLATE_ADMISSION_FAILED'}: ${error.message}`);
+    if (error.remediation) {
+      console.error(error.remediation);
+    }
+    process.exit(1);
+  }
+}
+
 function applyRunPlanToOptions(options, plan) {
   return {
     ...options,
@@ -2716,6 +2779,10 @@ program
     '--pr-body <template>',
     'PR body template; supports {{issue_number}}, {{issue_title}}, and {{issue_reference}}'
   )
+  .option(
+    '--pr-body-template-file <path>',
+    'Repository Markdown template snapshotted at admission and completed by a dedicated agent from validated run evidence (requires --pr or --ship; conflicts with --pr-body)'
+  )
   .option('--merge-queue', 'Use GitHub merge queue instead of direct merge')
   .option(
     '--close-issue <mode>',
@@ -2815,6 +2882,7 @@ Force provider flags: -G (GitHub), -L (GitLab), -J (Jira), -D (DevOps), -N (Line
       const providerOverride = resolveProviderOverride(options);
       const effectiveRunPlan = resolveEffectiveRunPlan(options, settings);
       const effectiveOptions = applyRunPlanToOptions(options, effectiveRunPlan);
+      admitPrBodyOptions(effectiveOptions, effectiveRunPlan);
 
       await runClusterPreflight({
         input,
@@ -6293,6 +6361,7 @@ if (require.main === module) {
 module.exports = {
   assertRequestedWebSearchCliAvailable,
   runClusterPreflight,
+  resolvePrBodyOptionsOrThrow,
   applyModelOverrideToConfig,
   inspectAgentAttachment,
   printAttachableAgentList,
