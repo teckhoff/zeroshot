@@ -2,8 +2,9 @@ use super::*;
 
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
-    JobObjectExtendedLimitInformation, SetInformationJobObject,
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
 };
 use std::os::windows::process::CommandExt;
 
@@ -255,17 +256,30 @@ fn inspect_controller_console() -> Result<(), String> {
     if console_window_visible() {
         return Err("controller console window is visible".into());
     }
+    // The controller breaks away from the harness Job, so its own kill-on-close Job stops cmd.exe
+    // and the grandchild whenever it exits, including when the harness kills it after a timeout.
+    // Only process exit closes the handle; closing it earlier would also kill the controller.
+    std::mem::forget(join_job(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE));
     // Launch like production, without console flags, and through cmd.exe as npm shims are.
     let mut line = std::ffi::OsString::from("/d /s /c \"\"");
     line.push(std::env::current_exe().unwrap());
     line.push(format!("\" --exact {CONSOLE_TEST} --nocapture\""));
-    let output = std::process::Command::new("cmd.exe")
+    let grandchild = std::process::Command::new("cmd.exe")
         .raw_arg(line)
         .env(CONSOLE_MODE, "grandchild")
         .env(OWNER, std::process::id().to_string())
         .stdin(std::process::Stdio::null())
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|error| format!("grandchild launch failed: {error}"))?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(grandchild.wait_with_output()));
+    // Report before the harness's 60-second limit so a hang surfaces as this failure.
+    let output = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .map_err(|_| "grandchild timed out".to_owned())?
+        .map_err(|error| format!("grandchild wait failed: {error}"))?;
     if output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed") {
         return Ok(());
     }
