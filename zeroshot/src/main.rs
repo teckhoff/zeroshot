@@ -14,9 +14,7 @@ use zeroshot_engine::native_v2_cli::{
     NativeV2CliCommand, NativeV2CliDiagnostic, NativeV2CliError, ERROR_FORMAT_ENV,
     JSON_ERROR_FORMAT,
 };
-use zeroshot_engine::native_v2_portable_controller::{
-    PortableControllerError, guard_controller_process, run_controller_process,
-};
+use zeroshot_engine::native_v2_portable_controller::{PortableControllerError, run_controller_process};
 
 use native_v2_target::{
     default_target_registry_path, serve_direct_target, FileTargetRegistry, NativeV2TargetConnector,
@@ -66,7 +64,6 @@ async fn run_private_controller(arguments: &[std::ffi::OsString]) -> Result<bool
     let Some(bootstrap) = private_controller_bootstrap(arguments)? else {
         return Ok(false);
     };
-    guard_controller_process()?;
     run_controller_process(&bootstrap).await?;
     Ok(true)
 }
